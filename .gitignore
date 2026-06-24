@@ -1,0 +1,40 @@
+# =============================================================================
+# BCRD 项目 .gitignore
+# =============================================================================
+# 训练 trajectory 数据（5GB+，可通过 scripts/batch_export_trajectories.py 复现）
+data/
+
+# 训练产物：模型 checkpoint / 训练日志 / 指标
+outputs/
+
+# Python 编译产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE / OS 临时文件
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 日志和临时
+*.log
+*.tmp
+*.bak
+.cache/
+
+# Jupyter
+.ipynb_checkpoints/
