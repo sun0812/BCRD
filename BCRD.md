@@ -25,18 +25,16 @@
 ## 2. 仓库结构（BCRD 新增部分）
 
 ```
-scripts/
+scripts/                            # 通用数据管线脚本
 ├── batch_export_trajectories.py    # schedule -> trajectory 批量导出
 ├── validate_trajectory_schema.py   # 流式 schema 校验
 └── shuffle_jsonl.py                # 一次性全局 shuffle JSONL
 
-models/
-└── bc_policy.py                    # 轻量 MLP candidate scorer (~20K 参数)
-
-data_utils/
-└── trajectory_dataset.py           # IterableDataset + 候选下采样 + 特征归一化
-
-train_bc.py                         # BC 训练入口
+bc/                                 # 行为克隆（BC）训练模块
+├── __init__.py                     # 统一导出 BCPolicy / TrajectoryStreamingDataset
+├── policy.py                       # 轻量 MLP candidate scorer (~20K 参数)
+├── dataset.py                      # IterableDataset + 候选下采样 + 特征归一化
+└── train.py                        # BC 训练入口（python -m bc.train ...）
 
 docs/
 ├── data_inventory.md               # 数据资产盘点
@@ -103,7 +101,7 @@ python scripts/shuffle_jsonl.py \
 ### 3.5 训练 BC baseline
 
 ```bash
-python train_bc.py \
+python -m bc.train \
     --train data/trajectories/all_schedules_shuffled.jsonl \
     --out outputs/bc_debug \
     --epochs 5 \
@@ -113,6 +111,8 @@ python train_bc.py \
     --use_objective_weights \
     --device cpu      # 或者 --device mps / --device cuda
 ```
+
+也可直接 `python bc/train.py ...`，两种调用方式等价。
 
 CPU 上 5 个 epoch 约 3 分钟；产出：
 - `outputs/bc_debug/checkpoint.pt`（val_loss 最佳的模型权重）
