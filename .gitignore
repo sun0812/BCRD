@@ -7,6 +7,12 @@ data/
 # 训练产物：模型 checkpoint / 训练日志 / 指标
 outputs/
 
+# 从 HuggingFace 下载的外部 scenario 数据（output_*.7z 及解压后的目录）
+external_data/
+
+# main_scheduler.py 默认扫描目录（含 scenario JSON + schedules）
+output/
+
 # Python 编译产物
 __pycache__/
 *.py[cod]
