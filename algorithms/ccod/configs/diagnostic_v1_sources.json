@@ -1,0 +1,138 @@
+{
+  "schema_version": "eosbench-ccod-source-inventory-v1",
+  "split_policy": {
+    "policy_version": "semantic-content-sha256-explicit-6-2-2-v1",
+    "canonicalizer_version": "eosbench-semantic-instance-v1",
+    "train": [
+      "cities_03",
+      "cities_05",
+      "cities_01",
+      "cities_09",
+      "cities_06",
+      "cities_07"
+    ],
+    "dev": [
+      "cities_08",
+      "cities_04"
+    ],
+    "test": [
+      "cities_02",
+      "cities_10"
+    ],
+    "sealed_test": true
+  },
+  "instances": [
+    {
+      "instance_alias": "cities_03",
+      "scenario_id": "Scenario_S3",
+      "filename": "Scenario_Sats1_M100_T7.0d_cities_03.json",
+      "raw_hash": "sha256:0a976c416f42ea4eec05e7f00d715a35523b8d33464f5d133845e09ecf092e4f",
+      "semantic_hash": "sha256:24ea2194243b919d5023219eea47f4d75d47e7b28ffcdc36d8a101ae651ce5c5"
+    },
+    {
+      "instance_alias": "cities_05",
+      "scenario_id": "Scenario_S5",
+      "filename": "Scenario_Sats1_M100_T7.0d_cities_05.json",
+      "raw_hash": "sha256:6a9142cd69eb1ad69bfee85417c6c041a41b36163ebdb4315df71c0a13202f3f",
+      "semantic_hash": "sha256:37876477bb7a9663c58c9a45535db9cd14fb5b435ee684d8eb0282be14fa932c"
+    },
+    {
+      "instance_alias": "cities_01",
+      "scenario_id": "Scenario_S1",
+      "filename": "Scenario_Sats1_M100_T7.0d_cities_01.json",
+      "raw_hash": "sha256:9e00c06905fb307839fac786836ef27be97e0effa0693230f6bfaa54ba65216e",
+      "semantic_hash": "sha256:40fac50bb648d09501d12fc0a64e48ad9db087a19db497c00e953df2423545be"
+    },
+    {
+      "instance_alias": "cities_09",
+      "scenario_id": "Scenario_S9",
+      "filename": "Scenario_Sats1_M100_T7.0d_cities_09.json",
+      "raw_hash": "sha256:c386a8a146d7653d6b2264bfc48277ae74e719c123a7b395aa815259bd8f2ad2",
+      "semantic_hash": "sha256:4c467ce08ffd37e57f636a0566768c19fa1db437cdaa9e63064622980ab70a85"
+    },
+    {
+      "instance_alias": "cities_06",
+      "scenario_id": "Scenario_S6",
+      "filename": "Scenario_Sats1_M100_T7.0d_cities_06.json",
+      "raw_hash": "sha256:f57cebe6231ac332ba80652d4624141be0c62d68ebee6b698be132fc40ffe8de",
+      "semantic_hash": "sha256:5b12d361c3db753c2e3289871d51b5f6482d35f33591cc388d13b643f370708d"
+    },
+    {
+      "instance_alias": "cities_07",
+      "scenario_id": "Scenario_S7",
+      "filename": "Scenario_Sats1_M100_T7.0d_cities_07.json",
+      "raw_hash": "sha256:5eb79e533ff29de89a28375210f735d905d892658b86cf3a5ffe9a874a6e6ba4",
+      "semantic_hash": "sha256:5e0b812f8b5dd5a422edcce6ad7435e41826897af8ba4a167689f368e7cae510"
+    },
+    {
+      "instance_alias": "cities_08",
+      "scenario_id": "Scenario_S8",
+      "filename": "Scenario_Sats1_M100_T7.0d_cities_08.json",
+      "raw_hash": "sha256:04d61cadf0d9d69af7f6e6db71fc3cea74404d2fe28c0ccddbd78bb1eaccd54e",
+      "semantic_hash": "sha256:6d3e16fbc491a60085919d8d39e74a928a94ebe188adfb5ec83c39951e48299b"
+    },
+    {
+      "instance_alias": "cities_04",
+      "scenario_id": "Scenario_S4",
+      "filename": "Scenario_Sats1_M100_T7.0d_cities_04.json",
+      "raw_hash": "sha256:4527a4f41043ab2d818eecd389b472f9916609b159714552e6568e45f8d1c5a2",
+      "semantic_hash": "sha256:c9c9a911e75bd153f8a0bd3cee3595ec134e60817a31b186bb6a319c3c330929"
+    },
+    {
+      "instance_alias": "cities_02",
+      "scenario_id": "Scenario_S2",
+      "filename": "Scenario_Sats1_M100_T7.0d_cities_02.json",
+      "raw_hash": "sha256:d2790c9df1d6edbefa9a4a7b9017f9571dfbefa51b3f59ec1c3a3d3de6dba668",
+      "semantic_hash": "sha256:d39f8f947bcb13210d5eb6bd7ccebac5b9e232f6ef67714cb91760bdfee9a0fb"
+    },
+    {
+      "instance_alias": "cities_10",
+      "scenario_id": "Scenario_S10",
+      "filename": "Scenario_Sats1_M100_T7.0d_cities_10.json",
+      "raw_hash": "sha256:3a988ab8107743e02f00f3aa57fb19ecfe6e1ae7728ba0f6659204e6989139d7",
+      "semantic_hash": "sha256:d6157be8f7dba6d15f569788ca35043c28de4a219a7b68a9baae1fb0f551f244"
+    }
+  ],
+  "dev_sources": {
+    "cities_08": [
+      {
+        "source_family": "sa",
+        "filename": "scheduler_Scenario_Sats1_M100_T7.0d_cities_08_c3_sa_p0.25_c0.25_t0.25_b0.25.json",
+        "sha256": "sha256:84e36b0984b90ef370f845710c67631ecb40d2177600591a761c05b01523d68a",
+        "scenario_id": "Scenario_S8"
+      },
+      {
+        "source_family": "ga",
+        "filename": "scheduler_Scenario_Sats1_M100_T7.0d_cities_08_c3_ga_p0.25_c0.25_t0.25_b0.25.json",
+        "sha256": "sha256:12f9ca6791c67ab5e13b59670160a28da59c209c8c0867d2ef675dd867bcf2b4",
+        "scenario_id": "Scenario_S8"
+      },
+      {
+        "source_family": "aco",
+        "filename": "scheduler_Scenario_Sats1_M100_T7.0d_cities_08_c3_aco_p0.25_c0.25_t0.25_b0.25.json",
+        "sha256": "sha256:abefd435549c116bd0a6020c6561297a9601c8f533a10df5967fc9ac05ce9f97",
+        "scenario_id": "Scenario_S8"
+      }
+    ],
+    "cities_04": [
+      {
+        "source_family": "sa",
+        "filename": "scheduler_Scenario_Sats1_M100_T7.0d_cities_04_c3_sa_p0.25_c0.25_t0.25_b0.25.json",
+        "sha256": "sha256:f072c0e86616dc273d3560fbbb87d9d03f3b43de3d5532dbd28ac3aaae965ee2",
+        "scenario_id": "Scenario_S4"
+      },
+      {
+        "source_family": "ga",
+        "filename": "scheduler_Scenario_Sats1_M100_T7.0d_cities_04_c3_ga_p0.25_c0.25_t0.25_b0.25.json",
+        "sha256": "sha256:b670284fa145701d9a1650e7e9f1b99566efb27c18c456622d924b4f0fd35084",
+        "scenario_id": "Scenario_S4"
+      },
+      {
+        "source_family": "aco",
+        "filename": "scheduler_Scenario_Sats1_M100_T7.0d_cities_04_c3_aco_p0.25_c0.25_t0.25_b0.25.json",
+        "sha256": "sha256:8c2f3108c75eeedd7d2bb21e3b33b740628325aa5a0bc3d541ee86934e4bd51a",
+        "scenario_id": "Scenario_S4"
+      }
+    ]
+  }
+}

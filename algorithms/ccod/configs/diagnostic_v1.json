@@ -1,0 +1,133 @@
+{
+  "schema_version": "eosbench-ccod-diagnostic-config-v2",
+  "seed": 20260715,
+  "split": {
+    "policy_version": "semantic-content-sha256-explicit-6-2-2-v1",
+    "canonicalizer_version": "eosbench-semantic-instance-v1",
+    "train": [
+      "cities_03",
+      "cities_05",
+      "cities_01",
+      "cities_09",
+      "cities_06",
+      "cities_07"
+    ],
+    "dev": [
+      "cities_08",
+      "cities_04"
+    ],
+    "test": [
+      "cities_02",
+      "cities_10"
+    ],
+    "sealed_test": true
+  },
+  "sources": {
+    "objective_name": "balanced",
+    "objective_weights": [
+      0.25,
+      0.25,
+      0.25,
+      0.25
+    ],
+    "solver_families": [
+      "sa",
+      "ga",
+      "aco"
+    ],
+    "schedule_suffix": "p0.25_c0.25_t0.25_b0.25"
+  },
+  "source_inventory": {
+    "path": "algorithms/ccod/configs/diagnostic_v1_sources.json",
+    "schema_version": "eosbench-ccod-source-inventory-v1",
+    "file_hash": "sha256:27cb6a28fd94f7c0360f6dd351c1607f80424b92c5001efba8682b89915311c5"
+  },
+  "replay": {
+    "max_candidates": 8192,
+    "placement_mode": "earliest",
+    "downlink_duration_ratio": 1.0,
+    "agility_profile": "Standard-Agility",
+    "non_agile_transition_s": 10.0,
+    "max_step_inclusive": 95
+  },
+  "state_selection": {
+    "total_states": 100,
+    "per_instance": {
+      "cities_08": 50,
+      "cities_04": 50
+    },
+    "actionable_min_candidates": 2,
+    "signal_min_candidates": 10,
+    "selector_min_candidates": 17,
+    "time_bins": 4,
+    "candidate_count_bins": 4,
+    "observed_skip_target_fraction": 0.30,
+    "max_cap_hits": 0,
+    "deduplicate_by": "state_hash",
+    "canonical_source_rank": "sha256(seed,state_hash,source_family)",
+    "selection_rank": "sha256(seed,instance_alias,state_hash)"
+  },
+  "query": {
+    "budget_per_state": 16,
+    "mandatory_actions": [
+      "observed",
+      "skip"
+    ],
+    "fill_policy": "eosbench-ccod-uniform-rank-v1",
+    "continuation_horizon": 5,
+    "workers": 1,
+    "max_attempts": 2,
+    "query_timeout_s": 120.0,
+    "state_timeout_s": 1200.0,
+    "worker_peak_rss_limit_mib": 6144.0
+  },
+  "signal_gate": {
+    "require_exact_selected_states": 100,
+    "require_all_queries_successful": true,
+    "actionable_min_candidates": 2,
+    "signal_min_candidates": 10,
+    "minimum_signal_states": 80,
+    "minimum_signal_states_per_instance": {
+      "cities_08": 40,
+      "cities_04": 40
+    },
+    "spread_metric": "Q_H_P90_minus_P10_type7",
+    "spread_threshold": 0.01,
+    "minimum_signal_pass_fraction": 0.60,
+    "minimum_per_instance_pass_fraction": 0.50,
+    "report_all_actionable_and_signal_separately": true,
+    "allow_confidence_interval_claim": false
+  },
+  "label_validity": {
+    "exhaustive_states": 20,
+    "exhaustive_candidate_count_min": 17,
+    "exhaustive_candidate_count_max": 128,
+    "strong_states": 10,
+    "exhaustive_selection": "stable_hash_balanced_instance_v1",
+    "strong_selection": "stable_hash_balanced_instance_v1",
+    "strong_candidate_count_min": 17,
+    "strong_disjoint_from_exhaustive": true,
+    "beam_width": 8,
+    "median_spearman_threshold": 0.70
+  },
+  "mac_training_gate": {
+    "overfit_states": 64,
+    "overfit_pairwise_accuracy_min": 0.95,
+    "pilot_states_min": 500,
+    "pilot_validation_pairwise_auc_min": 0.55,
+    "pilot_validation_spearman_min": 0.10,
+    "pilot_closed_loop_objective_delta_min": 0.0,
+    "wall_time_limit_s": 3600.0,
+    "peak_rss_limit_mib": 6144.0
+  },
+  "gpu_gate": {
+    "rent_3090_before_all_local_gates_pass": false,
+    "required_local_gates": [
+      "signal",
+      "label_validity",
+      "selector",
+      "mac_overfit",
+      "mac_one_seed_pilot"
+    ]
+  }
+}
