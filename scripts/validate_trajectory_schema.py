@@ -8,8 +8,8 @@ scripts/validate_trajectory_schema.py
 作用：在前 ``--max_rows`` 行（或 0 表示扫全文件）上验证以下内容：
 
     - 所有必填的顶层字段是否齐全
-    - ``state_features`` 是长度为 5 的浮点列表
-    - ``candidate_features`` 中每条候选向量长度为 10
+    - ``state_features`` 和 ``candidate_features`` 的维度在整个文件中一致
+      （优先读取可选 ``_schema``，否则从首个有效样本推断）
     - ``len(candidate_features) == len(candidate_keys) == len(valid_mask)``
     - ``expert_action_index`` 是落在合法区间 [0, num_candidates) 内的整数
     - SKIP 约定：``candidate_keys[0].is_skip == True``，
@@ -27,7 +27,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # 每一行 jsonl 样本必须出现的顶层字段集合
 REQUIRED_FIELDS = [
@@ -48,10 +48,6 @@ REQUIRED_FIELDS = [
     "schedule_metrics",
 ]
 
-# 维度约定，必须与 batch_export_trajectories.py 完全一致
-STATE_DIM = 5
-CAND_DIM = 10
-
 
 @dataclass
 class ValidationStats:
@@ -64,7 +60,15 @@ class ValidationStats:
     rows_failing_length_consistency: int = 0  # cands / keys / mask 长度不一致的行数
     rows_failing_label_range: int = 0  # expert_action_index 越界的行数
     rows_failing_skip_convention: int = 0  # SKIP 约定不成立的行数
+    rows_failing_schema_consistency: int = 0  # _schema 声明错误 / 版本或维度混用
+    schema_error_rows: Set[int] = field(default_factory=set, repr=False)
     missing_field_counts: Counter = field(default_factory=Counter)
+    rows_with_declared_schema: int = 0
+    expected_schema_version: Optional[str] = None
+    expected_state_dim: Optional[int] = None
+    expected_cand_dim: Optional[int] = None
+    state_dim_source: Optional[str] = None
+    cand_dim_source: Optional[str] = None
     skip_index0_count: int = 0  # candidate_keys[0] 标识为 skip 的行数
     expert_at_skip_count: int = 0  # expert_action_index == 0 的行数
     expert_at_positive_count: int = 0  # expert_action_index >= 1 的行数
@@ -83,6 +87,109 @@ class ValidationStats:
         if len(self.first_few_errors) < 20:
             self.first_few_errors.append(msg)
 
+    def note_schema_error(self, idx: int, msg: str) -> None:
+        """Count each malformed row once even if it has several schema errors."""
+        if idx not in self.schema_error_rows:
+            self.schema_error_rows.add(idx)
+            self.rows_failing_schema_consistency += 1
+        self.note_error(msg)
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    """Return a positive int while rejecting bool and malformed declarations."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _read_declared_schema(
+    idx: int,
+    row: Dict[str, Any],
+    stats: ValidationStats,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Read optional per-row schema metadata and enforce one file-level schema.
+
+    Legacy exports do not contain ``_schema`` and are intentionally accepted;
+    their dimensions are inferred from the first structurally valid row.
+    """
+    raw = row.get("_schema")
+    if raw is None:
+        return None, None
+
+    stats.rows_with_declared_schema += 1
+    errors: List[str] = []
+    if not isinstance(raw, dict):
+        errors.append(f"row {idx}: _schema must be an object, got {type(raw).__name__}")
+        state_dim = None
+        cand_dim = None
+    else:
+        version = raw.get("version")
+        if version is None:
+            errors.append(f"row {idx}: _schema.version is required when _schema is present")
+        else:
+            version_text = str(version)
+            if stats.expected_schema_version is None:
+                stats.expected_schema_version = version_text
+            elif version_text != stats.expected_schema_version:
+                errors.append(
+                    f"row {idx}: _schema.version={version_text!r}, "
+                    f"expected {stats.expected_schema_version!r}"
+                )
+
+        state_dim = _positive_int(raw.get("state_dim"))
+        cand_dim = _positive_int(raw.get("candidate_dim"))
+        if state_dim is None:
+            errors.append(f"row {idx}: _schema.state_dim must be a positive integer")
+        if cand_dim is None:
+            errors.append(f"row {idx}: _schema.candidate_dim must be a positive integer")
+
+    if errors:
+        for error in errors:
+            stats.note_schema_error(idx, error)
+    return state_dim, cand_dim
+
+
+def _set_or_check_dimensions(
+    idx: int,
+    stats: ValidationStats,
+    actual_state_dim: Optional[int],
+    actual_cand_dim: Optional[int],
+    declared_state_dim: Optional[int],
+    declared_cand_dim: Optional[int],
+) -> None:
+    """Establish dimensions once, then reject mixed schemas in the same file."""
+    if stats.expected_state_dim is None:
+        inferred = declared_state_dim if declared_state_dim is not None else actual_state_dim
+        if inferred is not None:
+            stats.expected_state_dim = inferred
+            stats.state_dim_source = "_schema" if declared_state_dim is not None else "first valid row"
+    if stats.expected_cand_dim is None:
+        inferred = declared_cand_dim if declared_cand_dim is not None else actual_cand_dim
+        if inferred is not None:
+            stats.expected_cand_dim = inferred
+            stats.cand_dim_source = "_schema" if declared_cand_dim is not None else "first valid row"
+
+    mismatches: List[str] = []
+    if (
+        declared_state_dim is not None
+        and stats.expected_state_dim is not None
+        and declared_state_dim != stats.expected_state_dim
+    ):
+        mismatches.append(
+            f"row {idx}: _schema.state_dim={declared_state_dim}, expected {stats.expected_state_dim}"
+        )
+    if (
+        declared_cand_dim is not None
+        and stats.expected_cand_dim is not None
+        and declared_cand_dim != stats.expected_cand_dim
+    ):
+        mismatches.append(
+            f"row {idx}: _schema.candidate_dim={declared_cand_dim}, expected {stats.expected_cand_dim}"
+        )
+    if mismatches:
+        for error in mismatches:
+            stats.note_schema_error(idx, error)
+
 
 def validate_row(idx: int, row: Dict[str, Any], stats: ValidationStats) -> None:
     """对单行 jsonl 进行结构验证，并把统计结果累加到 ``stats``。"""
@@ -97,15 +204,37 @@ def validate_row(idx: int, row: Dict[str, Any], stats: ValidationStats) -> None:
         return
     stats.rows_with_all_fields += 1
 
-    # ---------- 2) state_features 维度
+    # ---------- 2) schema 声明 + 文件级维度推断
     sf = row["state_features"]
-    if not isinstance(sf, list) or len(sf) != STATE_DIM:
-        stats.rows_failing_state_dim += 1
-        stats.note_error(f"row {idx}: state_features len={len(sf) if isinstance(sf, list) else 'NA'}, expected {STATE_DIM}")
-
     cf = row["candidate_features"]
     ck = row["candidate_keys"]
     vm = row["valid_mask"]
+
+    declared_state_dim, declared_cand_dim = _read_declared_schema(idx, row, stats)
+    actual_state_dim = len(sf) if isinstance(sf, list) and sf else None
+    actual_cand_dim = None
+    if isinstance(cf, list) and cf and isinstance(cf[0], list) and cf[0]:
+        actual_cand_dim = len(cf[0])
+    _set_or_check_dimensions(
+        idx,
+        stats,
+        actual_state_dim,
+        actual_cand_dim,
+        declared_state_dim,
+        declared_cand_dim,
+    )
+
+    expected_state_dim = stats.expected_state_dim
+    if (
+        not isinstance(sf, list)
+        or expected_state_dim is None
+        or len(sf) != expected_state_dim
+    ):
+        stats.rows_failing_state_dim += 1
+        stats.note_error(
+            f"row {idx}: state_features len="
+            f"{len(sf) if isinstance(sf, list) else 'NA'}, expected {expected_state_dim or 'inferred dimension'}"
+        )
 
     # ---------- 3) 三个列表的类型 + 长度一致性
     if not (isinstance(cf, list) and isinstance(ck, list) and isinstance(vm, list)):
@@ -118,10 +247,28 @@ def validate_row(idx: int, row: Dict[str, Any], stats: ValidationStats) -> None:
         stats.note_error(f"row {idx}: lens cand_feat={len(cf)} keys={len(ck)} mask={len(vm)}")
 
     # ---------- 4) 每个候选向量的维度
-    bad_dim = next((i for i, row_ in enumerate(cf) if not isinstance(row_, list) or len(row_) != CAND_DIM), None)
+    expected_cand_dim = stats.expected_cand_dim
+    bad_dim = next(
+        (
+            i
+            for i, row_ in enumerate(cf)
+            if not isinstance(row_, list)
+            or expected_cand_dim is None
+            or len(row_) != expected_cand_dim
+        ),
+        None,
+    )
     if bad_dim is not None:
         stats.rows_failing_cand_dim += 1
-        stats.note_error(f"row {idx}: candidate_features[{bad_dim}] dim={len(cf[bad_dim])}, expected {CAND_DIM}")
+        bad_value = cf[bad_dim]
+        stats.note_error(
+            f"row {idx}: candidate_features[{bad_dim}] dim="
+            f"{len(bad_value) if isinstance(bad_value, list) else 'NA'}, "
+            f"expected {expected_cand_dim or 'inferred dimension'}"
+        )
+    elif not cf:
+        stats.rows_failing_cand_dim += 1
+        stats.note_error(f"row {idx}: candidate_features is empty; cannot infer candidate dimension")
 
     # 候选数分布统计（min / mean / max）
     n = len(cf)
@@ -137,17 +284,21 @@ def validate_row(idx: int, row: Dict[str, Any], stats: ValidationStats) -> None:
         return
 
     # ---------- 6) SKIP 约定：candidate_keys[0] 必须是 skip 槽位
-    skip_marker_ok = False
-    if isinstance(ck[0], dict) and ck[0].get("is_skip") is True:
-        skip_marker_ok = True
+    skip_marker_ok = bool(ck) and isinstance(ck[0], dict) and ck[0].get("is_skip") is True
     if not skip_marker_ok:
         stats.rows_failing_skip_convention += 1
-        stats.note_error(f"row {idx}: candidate_keys[0]={ck[0]}, expected is_skip:True")
+        first_key = ck[0] if ck else None
+        stats.note_error(f"row {idx}: candidate_keys[0]={first_key}, expected is_skip:True")
     else:
         stats.skip_index0_count += 1
         # 同时核对 candidate_features[0][0] 是否为 1.0（is_skip 标志位）
-        if cf[0][0] != 1.0:
-            stats.note_error(f"row {idx}: cand_features[0][0]={cf[0][0]}, expected 1.0 (is_skip flag)")
+        skip_feature_ok = bool(cf) and isinstance(cf[0], list) and bool(cf[0]) and cf[0][0] == 1.0
+        if not skip_feature_ok:
+            stats.rows_failing_skip_convention += 1
+            first_feature = cf[0][0] if cf and isinstance(cf[0], list) and cf[0] else None
+            stats.note_error(
+                f"row {idx}: candidate_features[0][0]={first_feature}, expected 1.0 (is_skip flag)"
+            )
 
     # ---------- 7) 标签分布（SKIP vs positive）
     if label == 0:
@@ -168,6 +319,9 @@ def write_report(report_path: Path, stats: ValidationStats, input_path: Path, ma
     report_path.parent.mkdir(parents=True, exist_ok=True)
     n = stats.rows_checked or 1
     mean_cands = stats.num_cand_sum / n
+    min_cands = stats.num_cand_min if stats.rows_checked else 0
+    state_dim = stats.expected_state_dim if stats.expected_state_dim is not None else "not inferred"
+    cand_dim = stats.expected_cand_dim if stats.expected_cand_dim is not None else "not inferred"
 
     skip_share = stats.expert_at_skip_count / n
     pos_share = stats.expert_at_positive_count / n
@@ -197,8 +351,21 @@ def write_report(report_path: Path, stats: ValidationStats, input_path: Path, ma
 
     lines.append("## 3. Shape checks")
     lines.append("")
-    lines.append(f"- rows failing `len(state_features) == {STATE_DIM}`           : **{stats.rows_failing_state_dim}**")
-    lines.append(f"- rows failing per-candidate `len == {CAND_DIM}`              : **{stats.rows_failing_cand_dim}**")
+    lines.append(
+        f"- expected state dimension: **{state_dim}** "
+        f"(source: {stats.state_dim_source or 'none'})"
+    )
+    lines.append(
+        f"- expected candidate dimension: **{cand_dim}** "
+        f"(source: {stats.cand_dim_source or 'none'})"
+    )
+    lines.append(
+        f"- declared schema version: **{stats.expected_schema_version or 'legacy / absent'}**; "
+        f"rows carrying `_schema`: **{stats.rows_with_declared_schema} / {n}**"
+    )
+    lines.append(f"- rows failing `len(state_features) == {state_dim}`           : **{stats.rows_failing_state_dim}**")
+    lines.append(f"- rows failing per-candidate `len == {cand_dim}`              : **{stats.rows_failing_cand_dim}**")
+    lines.append(f"- rows failing schema/version consistency                     : **{stats.rows_failing_schema_consistency}**")
     lines.append(f"- rows failing `len(cands)==len(keys)==len(mask)`             : **{stats.rows_failing_length_consistency}**")
     lines.append(f"- rows failing `0 <= expert_action_index < num_candidates`    : **{stats.rows_failing_label_range}**")
     lines.append("")
@@ -231,7 +398,7 @@ def write_report(report_path: Path, stats: ValidationStats, input_path: Path, ma
 
     lines.append("## 6. Candidate-set size")
     lines.append("")
-    lines.append(f"- `num_candidates_incl_skip` min  = {stats.num_cand_min}")
+    lines.append(f"- `num_candidates_incl_skip` min  = {min_cands}")
     lines.append(f"- `num_candidates_incl_skip` mean = {mean_cands:.1f}")
     lines.append(f"- `num_candidates_incl_skip` max  = {stats.num_cand_max}")
     lines.append("")
@@ -249,6 +416,7 @@ def write_report(report_path: Path, stats: ValidationStats, input_path: Path, ma
     n_err = (
         stats.rows_failing_state_dim
         + stats.rows_failing_cand_dim
+        + stats.rows_failing_schema_consistency
         + stats.rows_failing_length_consistency
         + stats.rows_failing_label_range
         + stats.rows_failing_skip_convention
@@ -294,8 +462,13 @@ def main() -> int:
 
     write_report(args.report, stats, args.input, max_rows)
     print(f"[info] rows_checked={stats.rows_checked}")
+    print(
+        f"[info] feature_dims state/candidate="
+        f"{stats.expected_state_dim}/{stats.expected_cand_dim}"
+    )
     print(f"[info] expert_at_skip={stats.expert_at_skip_count}, expert_at_positive={stats.expert_at_positive_count}")
-    print(f"[info] candidates min/mean/max = {stats.num_cand_min}/{stats.num_cand_sum/(stats.rows_checked or 1):.1f}/{stats.num_cand_max}")
+    min_cands = stats.num_cand_min if stats.rows_checked else 0
+    print(f"[info] candidates min/mean/max = {min_cands}/{stats.num_cand_sum/(stats.rows_checked or 1):.1f}/{stats.num_cand_max}")
     print(f"[info] report -> {args.report}")
     return 0
 

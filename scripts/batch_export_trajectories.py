@@ -103,6 +103,18 @@ _OBJ_RE = re.compile(
     r"^p(?P<p>[\d.]+)_c(?P<c>[\d.]+)_t(?P<t>[\d.]+)_b(?P<b>[\d.]+)$"
 )
 
+# Class-2 heuristic schedules encode their objective in the algorithm name and
+# therefore use the literal ``implicit`` objective tag in the filename.  Keep
+# this mapping next to the filename parser so replay rewards use the intended
+# metric instead of passing all-zero weights to ObjectiveWeights.normalized(),
+# whose documented fallback is profit-only.
+_IMPLICIT_OBJECTIVE_WEIGHTS: Dict[str, Tuple[float, float, float, float]] = {
+    "profit_first": (1.0, 0.0, 0.0, 0.0),
+    "completion_first": (0.0, 1.0, 0.0, 0.0),
+    "timeliness_first": (0.0, 0.0, 1.0, 0.0),
+    "balance_first": (0.0, 0.0, 0.0, 1.0),
+}
+
 
 def parse_schedule_filename(stem: str) -> Dict[str, Any]:
     """Parse ``scheduler_<scenario>_c<id>_<algo>[_<obj_tag>].json`` -> dict.
@@ -122,7 +134,9 @@ def parse_schedule_filename(stem: str) -> Dict[str, Any]:
         info["class_id"] = int(m.group("cid"))
         info["solver_name"] = m.group("algo")
         info["objective_tag"] = m.group("obj")
-        info["objective_weights"] = _parse_obj_weights(m.group("obj"))
+        info["objective_weights"] = _parse_obj_weights(
+            m.group("obj"), solver_name=m.group("algo")
+        )
         return info
 
     m = _C3_RE.search(stem)
@@ -150,8 +164,11 @@ def parse_schedule_filename(stem: str) -> Dict[str, Any]:
     return info
 
 
-def _parse_obj_weights(obj_tag: str) -> List[float]:
+def _parse_obj_weights(obj_tag: str, solver_name: Optional[str] = None) -> List[float]:
     if obj_tag == "implicit" or obj_tag is None:
+        implicit = _IMPLICIT_OBJECTIVE_WEIGHTS.get((solver_name or "").lower())
+        if implicit is not None:
+            return list(implicit)
         return [0.0, 0.0, 0.0, 0.0]
     m = _OBJ_RE.match(obj_tag)
     if not m:
@@ -240,6 +257,9 @@ def match_assignment_to_window(
 # =============================================================================
 # Feature extraction (state + candidate features)
 # =============================================================================
+
+
+TRAJECTORY_SCHEMA_VERSION = "eosbench-trajectory-v1"
 
 
 CAND_FEAT_NAMES = (
@@ -601,6 +621,13 @@ def replay_schedule(
             expert_window_uid = None
 
         samples.append({
+            # Optional, self-describing metadata.  It is deliberately not a
+            # required field so existing JSONL exports remain readable.
+            "_schema": {
+                "version": TRAJECTORY_SCHEMA_VERSION,
+                "state_dim": len(state_feats),
+                "candidate_dim": len(CAND_FEAT_NAMES),
+            },
             "scenario_id": problem.scenario_id,
             "schedule_file": str(schedule_path.name),
             "solver_name": parsed["solver_name"],
