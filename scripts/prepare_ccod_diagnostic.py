@@ -1498,12 +1498,13 @@ def prepare_diagnostic(
     catalog_only: bool,
 ) -> Dict[str, Any]:
     """执行输入验证、catalog 冻结，并按需冻结 query plan。"""
+    # 先锁定解释器，错误运行时不得采集 provenance、读取来源或恢复状态。
+    config = _load_json(config_path)
+    validate_diagnostic_runtime(config)
     preparation_implementation = _preparation_implementation_bundle()
     config_file_hash = sha256_file(config_path)
     # 只采一次并传给六个来源，保证 trace provenance 在整次运行内一致。
     replay_code_provenance = collect_code_provenance()
-    config = _load_json(config_path)
-    validate_diagnostic_runtime(config)
     inventory_path = REPO_ROOT / config["source_inventory"]["path"]
     inventory, split_manifest = _validate_source_inventory(
         config,

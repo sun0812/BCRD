@@ -142,13 +142,18 @@ class CCODDiagnosticTest(unittest.TestCase):
         with CONFIG_PATH.open("r", encoding="utf-8") as handle:
             config = json.load(handle)
         validate_diagnostic_config(config)
-        validate_diagnostic_runtime(config)
         self.assertEqual(config["split"]["dev"], ["cities_08", "cities_04"])
         self.assertEqual(config["state_selection"]["deduplicate_by"], "state_hash")
 
-    def test_runtime_gate_rejects_non_frozen_interpreter(self) -> None:
-        """错误 Python 必须在读取诊断来源前被明确拒绝。"""
+    def test_runtime_gate_accepts_exact_identity_and_rejects_drift(self) -> None:
+        """只有精确的 CPython 3.10.20 才能进入诊断流程。"""
         config = self._config()
+        with patch(
+            "algorithms.ccod.diagnostic._current_python_runtime",
+            return_value=dict(config["runtime"]),
+        ):
+            validate_diagnostic_runtime(config)
+
         with patch(
             "algorithms.ccod.diagnostic._current_python_runtime",
             return_value={
@@ -161,6 +166,28 @@ class CCODDiagnosticTest(unittest.TestCase):
                 "解释器不匹配",
             ):
                 validate_diagnostic_runtime(config)
+
+    def test_config_rejects_runtime_protocol_drift(self) -> None:
+        """冻结配置本身不得把版本悄悄改成其他 Python。"""
+        mutations = {
+            "wrong_version": lambda runtime: runtime.update(
+                python_version="3.14.6"
+            ),
+            "wrong_implementation": lambda runtime: runtime.update(
+                python_implementation="pypy"
+            ),
+            "extra_field": lambda runtime: runtime.update(build="local"),
+            "missing_field": lambda runtime: runtime.pop("python_version"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                config = self._config()
+                mutate(config["runtime"])
+                with self.assertRaisesRegex(
+                    DiagnosticConfigError,
+                    "CPython 3.10.20",
+                ):
+                    validate_diagnostic_config(config)
 
     def test_balanced_objective_mapping_is_strict(self) -> None:
         self.assertEqual(

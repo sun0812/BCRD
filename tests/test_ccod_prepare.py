@@ -25,6 +25,40 @@ SCHEDULE_DIR = REPO_ROOT / "output/schedules/output_re_s1"
 class CCODPreparePureFunctionTest(unittest.TestCase):
     """验证不可变发布、稳定身份与轻量清单哈希。"""
 
+    def test_wrong_runtime_fails_before_provenance_or_source_reads(self) -> None:
+        """错误解释器必须在采集 provenance 和触碰来源前失败。"""
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "algorithms.ccod.diagnostic._current_python_runtime",
+            return_value={
+                "python_implementation": "cpython",
+                "python_version": "3.14.6",
+            },
+        ), patch.object(
+            prepare,
+            "_preparation_implementation_bundle",
+        ) as implementation_bundle, patch.object(
+            prepare,
+            "collect_code_provenance",
+        ) as provenance, patch.object(
+            prepare,
+            "_validate_source_inventory",
+        ) as source_validator:
+            with self.assertRaisesRegex(
+                ValueError,
+                "解释器不匹配",
+            ):
+                prepare.prepare_diagnostic(
+                    config_path=CONFIG_PATH,
+                    scenario_dir=Path(directory) / "scenarios",
+                    schedule_dir=Path(directory) / "schedules",
+                    out_dir=Path(directory) / "frozen",
+                    catalog_only=True,
+                )
+
+        implementation_bundle.assert_not_called()
+        provenance.assert_not_called()
+        source_validator.assert_not_called()
+
     def test_publish_bytes_accepts_identical_content_and_rejects_conflict(
         self,
     ) -> None:

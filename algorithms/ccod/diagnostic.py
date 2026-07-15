@@ -448,11 +448,13 @@ def validate_diagnostic_config(config: Mapping[str, Any]) -> None:
 
 def _current_python_runtime() -> Dict[str, str]:
     """返回会进入诊断科学身份的解释器实现与精确版本。"""
+    version = ".".join(str(part) for part in sys.version_info[:3])
+    if sys.version_info.releaselevel != "final":
+        # 3.10.20rc1 不得伪装成已冻结的 3.10.20 正式版。
+        version += f"{sys.version_info.releaselevel}{sys.version_info.serial}"
     return {
         "python_implementation": sys.implementation.name,
-        "python_version": ".".join(
-            str(part) for part in sys.version_info[:3]
-        ),
+        "python_version": version,
     }
 
 
@@ -464,7 +466,8 @@ def validate_diagnostic_runtime(config: Mapping[str, Any]) -> None:
     if actual != expected:
         raise DiagnosticConfigError(
             "diagnostic_v1 解释器不匹配: "
-            f"expected={expected}, actual={actual}"
+            f"expected={expected}, actual={actual}; "
+            "请使用仓库 .venv/bin/python"
         )
 
 
