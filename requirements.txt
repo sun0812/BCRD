@@ -1,0 +1,8 @@
+# Runtime dependencies used by scheduling, analysis, and BC training.
+# Scenario generation through Orekit remains optional; see README.md.
+matplotlib==3.9.4
+numpy==2.0.2
+openpyxl==3.1.5
+pandas==2.3.3
+PuLP==3.3.2
+torch==2.8.0
