@@ -21,6 +21,7 @@ from scripts.run_ccod_diagnostic import (
     RunnerAttemptError,
     _acquire_run_lock,
     _heartbeat_journal,
+    _open_label_cache,
     _launch_state_attempt,
     _result_rows_from_cache,
     _restore_state_progress,
@@ -360,6 +361,81 @@ class GuardTest(unittest.TestCase):
                 root / "run" / "cache",
             )
         self.assertEqual(resolved[0].name, "frozen")
+
+    def test_cache_shard_symlink_cannot_write_frozen_tree(self) -> None:
+        """cache 两位 shard 即使预置链接也不得逃逸到冻结目录。"""
+        from algorithms.ccod.continuation import CounterfactualError
+
+        identity = _query(0, "sha256:" + "56" * 32)["query_identity"]
+        key = sha256_json(identity)
+        shard = key.removeprefix("sha256:")[:2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            frozen = root / "frozen"
+            cache_root = root / "cache"
+            frozen.mkdir()
+            cache_root.mkdir()
+            sentinel = frozen / "sentinel.txt"
+            sentinel.write_text("冻结", encoding="utf-8")
+            (cache_root / shard).symlink_to(frozen, target_is_directory=True)
+            before = {
+                path.relative_to(frozen).as_posix(): path.read_bytes()
+                for path in frozen.rglob("*")
+                if path.is_file()
+            }
+            cache = _open_label_cache(cache_root)
+            with mock.patch(
+                "algorithms.ccod.cache._validate_result_identity",
+                return_value=None,
+            ):
+                with self.assertRaises(CounterfactualError):
+                    cache.store(identity, _FakeResult(key))
+            after = {
+                path.relative_to(frozen).as_posix(): path.read_bytes()
+                for path in frozen.rglob("*")
+                if path.is_file()
+            }
+        self.assertEqual(after, before)
+
+    def test_secure_cache_roundtrip_uses_frozen_record_schema(self) -> None:
+        """安全 cache 仍须兼容冻结记录格式并能完成原子读写。"""
+        identity = _query(0, "sha256:" + "56" * 32)["query_identity"]
+        key = sha256_json(identity)
+        payload = {"query_key": key, "q_h_hex": 0.25.hex()}
+        payload["result_hash"] = sha256_json(payload)
+        result = SimpleNamespace(to_manifest=lambda: dict(payload))
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "algorithms.ccod.cache._validate_result_identity",
+            return_value=None,
+        ):
+            cache = _open_label_cache(Path(directory) / "cache")
+            path = cache.store(identity, result)
+            self.assertTrue(path.is_file())
+            self.assertEqual(cache.load(identity), payload)
+            self.assertEqual(cache.store(identity, result), path)
+
+    def test_cache_root_symlink_inserted_after_open_is_rejected(self) -> None:
+        """构造 cache 视图后替换根目录也不能把记录写入外部目录。"""
+        from algorithms.ccod.continuation import CounterfactualError
+
+        identity = _query(0, "sha256:" + "56" * 32)["query_identity"]
+        key = sha256_json(identity)
+        payload = {"query_key": key, "q_h_hex": 0.25.hex()}
+        payload["result_hash"] = sha256_json(payload)
+        result = SimpleNamespace(to_manifest=lambda: dict(payload))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            cache_root = root / "cache"
+            outside = root / "outside"
+            outside.mkdir()
+            cache = _open_label_cache(cache_root)
+            cache_root.symlink_to(outside, target_is_directory=True)
+            with mock.patch(
+                "algorithms.ccod.cache._validate_result_identity",
+                return_value=None,
+            ), self.assertRaises((CCODRunnerError, CounterfactualError)):
+                cache.store(identity, result)
+            self.assertEqual(list(outside.iterdir()), [])
 
     def test_input_symlink_is_rejected_before_resolve(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -840,7 +916,7 @@ class ParentOrchestrationTest(unittest.TestCase):
         )
         stack.enter_context(
             mock.patch(
-                "algorithms.ccod.cache.CounterfactualLabelCache",
+                "scripts.run_ccod_diagnostic._open_label_cache",
                 return_value=cache,
             )
         )
@@ -926,6 +1002,7 @@ class ParentOrchestrationTest(unittest.TestCase):
                 "scripts.run_ccod_diagnostic._frozen_snapshot",
                 side_effect=[
                     {"snapshot_hash": "sha256:" + "ab" * 32},
+                    {"snapshot_hash": "sha256:" + "ab" * 32},
                     {"snapshot_hash": "sha256:" + "ac" * 32},
                 ],
             ):
@@ -976,6 +1053,7 @@ class ParentOrchestrationTest(unittest.TestCase):
                 "scripts.run_ccod_diagnostic._frozen_snapshot",
                 side_effect=[
                     {"snapshot_hash": "sha256:" + "ab" * 32},
+                    {"snapshot_hash": "sha256:" + "ab" * 32},
                     {"snapshot_hash": "sha256:" + "cd" * 32},
                 ],
             ):
@@ -1006,7 +1084,7 @@ class ParentOrchestrationTest(unittest.TestCase):
             stack, launcher = self._patch_parent(plan, cache)
             with stack, mock.patch(
                 "scripts.run_ccod_diagnostic._frozen_snapshot",
-                side_effect=[same, same, changed],
+                side_effect=[same, same, same, changed],
             ):
                 result = run_diagnostic(frozen_dir=frozen, run_dir=run)
         launcher.assert_not_called()
@@ -1239,11 +1317,41 @@ class FrozenPlanIntegrationTest(unittest.TestCase):
         )
         failed = [row for row in rows if row["status"] == "failed"]
         self.assertEqual(len(failed), len(self.plan.queries_by_state[0]))
-        self.assertTrue(all(row["attempts_exhausted"] == 2 for row in failed))
+        self.assertTrue(all(row["attempts_started"] == 2 for row in failed))
+        self.assertTrue(all(row["attempt_budget"] == 2 for row in failed))
+        self.assertTrue(
+            all(not row["state_budget_exhausted"] for row in failed)
+        )
         summary = summarize_signal_gate(self.plan, self.identity, rows)
         self.assertEqual(summary["execution_status"], "incomplete")
         self.assertEqual(summary["signal_gate"], "not_evaluated")
         self.assertEqual(summary["failed_queries"], len(failed))
+
+    def test_state_deadline_records_only_the_attempt_actually_started(self) -> None:
+        """一次 attempt 耗尽 state wall-time 时不得伪造第二次进程启动。"""
+        from algorithms.ccod.execution import summarize_signal_gate
+
+        cache = _FakeCache()
+        failures = _terminal_missing_queries(
+            self.plan,
+            cache,
+            0,
+            "state_timeout",
+            attempts_started=1,
+            state_budget_exhausted=True,
+        )
+        rows = _result_rows_from_cache(
+            self.plan,
+            cache,
+            self.execution_id,
+            set(),
+            failures,
+        )
+        failed = [row for row in rows if row["status"] == "failed"]
+        self.assertTrue(all(row["attempts_started"] == 1 for row in failed))
+        self.assertTrue(all(row["state_budget_exhausted"] for row in failed))
+        summary = summarize_signal_gate(self.plan, self.identity, rows)
+        self.assertEqual(summary["execution_status"], "incomplete")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
+import errno
 import fcntl
 import hashlib
 import json
@@ -282,6 +283,50 @@ def _write_json(
     return record
 
 
+def _write_json_exclusive(
+    path: Path, payload: Mapping[str, Any], hash_field: str
+) -> Dict[str, Any]:
+    """以同目录临时文件+hard-link 发布不可覆盖的证据 JSON。"""
+    record = _with_hash(payload, hash_field)
+    if path.is_symlink():
+        raise CCODRunnerError(f"证据目标不得为符号链接: {path}")
+    _reject_symlink_components(path.parent, label="证据目录")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(_canonical_bytes(record) + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise CCODRunnerError(f"证据已存在，拒绝覆盖: {path}") from exc
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except CCODRunnerError:
+        raise
+    except OSError as exc:
+        raise CCODRunnerError(f"无法排他发布证据 {path}: {exc}") from exc
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return record
+
+
 def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
     """按调用方给定顺序原子重建 JSONL。"""
     body = b"".join(_canonical_bytes(dict(row)) + b"\n" for row in rows)
@@ -445,6 +490,222 @@ def execution_prefix(
     return ordinals, queries
 
 
+def _prepare_cache_root(root: Path) -> Path:
+    """只在父进程持有 run lock 时创建 cache 根，并拒绝符号链接。"""
+    target = root.expanduser()
+    if not target.is_absolute():
+        target = Path.cwd() / target
+    if target.is_symlink():
+        raise CCODRunnerError(f"cache 根目录不允许符号链接: {target}")
+    _reject_symlink_components(target.parent, label="cache 父目录")
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise CCODRunnerError(f"无法创建 cache 根目录 {target}: {exc}") from exc
+    _reject_symlink_components(target, label="cache 根目录")
+    if not target.is_dir():
+        raise CCODRunnerError(f"cache 根路径不是目录: {target}")
+    return target
+
+
+class _SecureCounterfactualLabelCache:
+    """用 dirfd/O_NOFOLLOW 封装冻结 cache schema，防止 shard 链接逃逸。"""
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root).resolve(strict=False)
+
+    @staticmethod
+    def _parts(identity: Mapping[str, Any]) -> Tuple[Dict[str, Any], str, str, str]:
+        from algorithms.ccod.cache import _canonical_object_copy, cache_key
+
+        normalized = _canonical_object_copy(identity)
+        key = cache_key(normalized)
+        digest = key.removeprefix("sha256:")
+        return normalized, key, digest[:2], f"{digest}.json"
+
+    def _open_root(self) -> int:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            return os.open(self.root, flags)
+        except OSError as exc:
+            from algorithms.ccod.continuation import CounterfactualError
+
+            raise CounterfactualError(f"cache 根目录不安全: {self.root}: {exc}") from exc
+
+    @staticmethod
+    def _open_shard(root_fd: int, shard: str, *, create: bool) -> Optional[int]:
+        from algorithms.ccod.continuation import CounterfactualError
+
+        if create:
+            try:
+                os.mkdir(shard, 0o700, dir_fd=root_fd)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise CounterfactualError(f"无法创建 cache shard {shard}: {exc}") from exc
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            return os.open(shard, flags, dir_fd=root_fd)
+        except FileNotFoundError:
+            if not create:
+                return None
+            raise
+        except OSError as exc:
+            raise CounterfactualError(f"cache shard 不安全 {shard}: {exc}") from exc
+
+    @staticmethod
+    def _decode_record(handle: Any, path_label: str) -> Dict[str, Any]:
+        from algorithms.ccod.cache import (
+            LABEL_CACHE_SCHEMA_VERSION,
+            _validate_result_identity,
+        )
+        from algorithms.ccod.continuation import CounterfactualError
+
+        def reject_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+            value: Dict[str, Any] = {}
+            for key, item in pairs:
+                if key in value:
+                    raise CounterfactualError(f"cache record 含重复键: {key}")
+                value[key] = item
+            return value
+
+        try:
+            record = json.load(handle, object_pairs_hook=reject_duplicates)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CounterfactualError(f"无法读取 cache record {path_label}: {exc}") from exc
+        if not isinstance(record, dict) or set(record) != {
+            "schema_version",
+            "cache_key",
+            "identity",
+            "result",
+            "record_hash",
+        }:
+            raise CounterfactualError(f"cache record 字段集非法: {path_label}")
+        stored_hash = record["record_hash"]
+        unhashed = {key: value for key, value in record.items() if key != "record_hash"}
+        if stored_hash != _sha256_json(unhashed):
+            raise CounterfactualError(f"cache record hash 不一致: {path_label}")
+        if record["schema_version"] != LABEL_CACHE_SCHEMA_VERSION:
+            raise CounterfactualError(f"cache schema 不一致: {path_label}")
+        result = record["result"]
+        if not isinstance(result, dict):
+            raise CounterfactualError(f"cache result 必须是 object: {path_label}")
+        result_unhashed = {
+            key: value for key, value in result.items() if key != "result_hash"
+        }
+        if result.get("result_hash") != _sha256_json(result_unhashed):
+            raise CounterfactualError(f"cache result hash 不一致: {path_label}")
+        _validate_result_identity(record["identity"], result, record["cache_key"])
+        return record
+
+    def load(self, identity: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """通过持有的 root/shard dirfd 读取，不跟随任何链接。"""
+        from algorithms.ccod.continuation import CounterfactualError
+
+        normalized, key, shard, filename = self._parts(identity)
+        if not self.root.exists():
+            return None
+        root_fd = self._open_root()
+        shard_fd: Optional[int] = None
+        try:
+            shard_fd = self._open_shard(root_fd, shard, create=False)
+            if shard_fd is None:
+                return None
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                record_fd = os.open(filename, flags, dir_fd=shard_fd)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise CounterfactualError(f"cache record 不安全 {filename}: {exc}") from exc
+            with os.fdopen(record_fd, "r", encoding="utf-8") as handle:
+                record = self._decode_record(handle, f"{shard}/{filename}")
+            if record["cache_key"] != key or record["identity"] != normalized:
+                raise CounterfactualError(f"cache identity 不一致: {shard}/{filename}")
+            return dict(record["result"])
+        finally:
+            if shard_fd is not None:
+                os.close(shard_fd)
+            os.close(root_fd)
+
+    def store(self, identity: Mapping[str, Any], result: Any) -> Path:
+        """在 shard dirfd 内以 O_EXCL 临时文件+hard-link 原子发布。"""
+        from algorithms.ccod.cache import (
+            LABEL_CACHE_SCHEMA_VERSION,
+            _validate_result_identity,
+        )
+        from algorithms.ccod.continuation import CounterfactualError
+
+        normalized, key, shard, filename = self._parts(identity)
+        result_payload = result.to_manifest()
+        _validate_result_identity(normalized, result_payload, key)
+        record: Dict[str, Any] = {
+            "schema_version": LABEL_CACHE_SCHEMA_VERSION,
+            "cache_key": key,
+            "identity": normalized,
+            "result": result_payload,
+        }
+        record["record_hash"] = _sha256_json(record)
+        payload = _canonical_bytes(record) + b"\n"
+        _prepare_cache_root(self.root)
+        root_fd = self._open_root()
+        shard_fd: Optional[int] = None
+        temporary: Optional[str] = None
+        try:
+            shard_fd = self._open_shard(root_fd, shard, create=True)
+            assert shard_fd is not None
+            existing = self.load(normalized)
+            if existing is not None:
+                if existing != result_payload:
+                    raise CounterfactualError("cache 键冲突或结果非确定")
+                return self.root / shard / filename
+            temporary = f".{filename}.{os.getpid()}.{time.time_ns()}.tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            temp_fd = os.open(temporary, flags, 0o600, dir_fd=shard_fd)
+            try:
+                with os.fdopen(temp_fd, "wb", closefd=False) as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                os.close(temp_fd)
+            try:
+                os.link(
+                    temporary,
+                    filename,
+                    src_dir_fd=shard_fd,
+                    dst_dir_fd=shard_fd,
+                    follow_symlinks=False,
+                )
+                os.fsync(shard_fd)
+            except FileExistsError:
+                existing = self.load(normalized)
+                if existing != result_payload:
+                    raise CounterfactualError("cache 键冲突或结果非确定")
+            return self.root / shard / filename
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise CounterfactualError(f"cache shard/record 含符号链接: {exc}") from exc
+            raise CounterfactualError(f"安全写入 cache 失败: {exc}") from exc
+        finally:
+            if temporary is not None and shard_fd is not None:
+                try:
+                    os.unlink(temporary, dir_fd=shard_fd)
+                except FileNotFoundError:
+                    pass
+            if shard_fd is not None:
+                os.close(shard_fd)
+            os.close(root_fd)
+
+
+def _open_label_cache(root: str | Path) -> _SecureCounterfactualLabelCache:
+    """统一创建 runner 专用的安全 cache 视图。"""
+    return _SecureCounterfactualLabelCache(root)
+
+
 def _peak_rss_mib() -> float:
     """把当前进程 ru_maxrss 统一换算为 MiB。"""
     raw = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
@@ -502,13 +763,36 @@ def _load_cached_group(
     """完整加载一个 state 的现有缓存，坏记录由 cache.load 直接报错。"""
     cached: Dict[str, Mapping[str, Any]] = {}
     for query in plan.queries_by_state[state_ordinal]:
-        value = cache.load(_mutable_json_copy(query["query_identity"]))
+        value = _cache_load(
+            cache,
+            _mutable_json_copy(query["query_identity"]),
+        )
         if value is not None:
             key = str(query["query_key"])
             if value.get("query_key") != key:
                 raise CCODRunnerError("缓存 query_key 与冻结计划不一致")
             cached[key] = value
     return cached
+
+
+def _cache_load(cache: Any, identity: Mapping[str, Any]) -> Any:
+    """在明确的缓存边界把 CounterfactualError 分类为完整性失败。"""
+    from algorithms.ccod.continuation import CounterfactualError
+
+    try:
+        return cache.load(identity)
+    except CounterfactualError as exc:
+        raise RunnerAttemptError("cache_corrupt", str(exc)) from exc
+
+
+def _cache_store(cache: Any, identity: Mapping[str, Any], result: Any) -> Any:
+    """保存缓存并把冲突、损坏或结果身份错误标为不可恢复。"""
+    from algorithms.ccod.continuation import CounterfactualError
+
+    try:
+        return cache.store(identity, result)
+    except CounterfactualError as exc:
+        raise RunnerAttemptError("cache_corrupt", str(exc)) from exc
 
 
 def _continuation_for_plan(plan: Any) -> Any:
@@ -588,7 +872,7 @@ def execute_state_worker(
         identity = _mutable_json_copy(query["query_identity"])
         action_key = _mutable_json_copy(query["action_key"])
         # 与 evaluate 紧邻地再次检查，支持中断恢复或另一 writer 已发布同 key。
-        if cache.load(identity) is not None:
+        if _cache_load(cache, identity) is not None:
             continue
         heartbeat(
             "query_start",
@@ -605,20 +889,29 @@ def execute_state_worker(
             )
             manifest = result.to_manifest()
             if manifest.get("query_key") != query.get("query_key"):
-                raise CCODRunnerError("Oracle 结果 query_key 偏离冻结计划")
+                raise RunnerAttemptError(
+                    "identity_mismatch", "Oracle 结果 query_key 偏离冻结计划"
+                )
             if "state_hash" in manifest and manifest.get("state_hash") != query.get(
                 "state_hash"
             ):
-                raise CCODRunnerError("Oracle 结果 state_hash 偏离冻结计划")
+                raise RunnerAttemptError(
+                    "identity_mismatch", "Oracle 结果 state_hash 偏离冻结计划"
+                )
             if (
                 "forced_action_key" in manifest
                 and manifest.get("forced_action_key") != action_key
             ):
-                raise CCODRunnerError("Oracle 结果 forced_action_key 偏离冻结计划")
-            cache.store(identity, result)
-            reloaded = cache.load(identity)
+                raise RunnerAttemptError(
+                    "identity_mismatch",
+                    "Oracle 结果 forced_action_key 偏离冻结计划",
+                )
+            _cache_store(cache, identity, result)
+            reloaded = _cache_load(cache, identity)
             if reloaded is None or reloaded != manifest:
-                raise CCODRunnerError("cache store/load 闭环校验失败")
+                raise RunnerAttemptError(
+                    "cache_corrupt", "cache store/load 闭环校验失败"
+                )
         key = str(query["query_key"])
         evaluated.append(key)
         peak_rss = max(peak_rss, _peak_rss_mib())
@@ -635,7 +928,9 @@ def execute_state_worker(
 
     final_group = _load_cached_group(plan, state_ordinal, cache)
     if len(final_group) != len(queries):
-        raise CCODRunnerError("worker 结束时 state cache 仍不完整")
+        raise RunnerAttemptError(
+            "cache_corrupt", "worker 结束时 state cache 仍不完整"
+        )
     report = {
         "state_ordinal": state_ordinal,
         "restored": True,
@@ -931,14 +1226,14 @@ def _result_rows_from_cache(
     cache: Any,
     execution_id: str,
     initially_cached: Set[str],
-    terminal_failures: Mapping[str, str],
+    terminal_failures: Mapping[str, Mapping[str, Any]],
 ) -> List[Dict[str, Any]]:
     """按完整冻结顺序从缓存重建已有成功标签。"""
     rows = []
     for query in plan.query_rows:
         query_key = str(query["query_key"])
-        failure_kind = terminal_failures.get(query_key)
-        if failure_kind is not None:
+        failure = terminal_failures.get(query_key)
+        if failure is not None:
             failed = {
                 "schema_version": QUERY_RESULT_SCHEMA_VERSION,
                 "execution_id": execution_id,
@@ -949,12 +1244,19 @@ def _result_rows_from_cache(
                 "state_hash": query["state_hash"],
                 "query_key": query_key,
                 "status": "failed",
-                "failure_kind": failure_kind,
-                "attempts_exhausted": FROZEN_MAX_ATTEMPTS,
+                "failure_kind": str(failure["failure_kind"]),
+                "attempts_started": int(failure["attempts_started"]),
+                "attempt_budget": FROZEN_MAX_ATTEMPTS,
+                "state_budget_exhausted": bool(
+                    failure["state_budget_exhausted"]
+                ),
             }
             rows.append(_with_hash(failed, "row_hash"))
             continue
-        cached = cache.load(_mutable_json_copy(query["query_identity"]))
+        cached = _cache_load(
+            cache,
+            _mutable_json_copy(query["query_identity"]),
+        )
         if cached is None:
             continue
         if cached.get("query_key") != query.get("query_key"):
@@ -1162,7 +1464,6 @@ def _worker_main(args: argparse.Namespace) -> int:
             raise CCODRunnerError("worker attempt 未绑定父进程当前 active 状态")
         if _frozen_snapshot(frozen).get("snapshot_hash") != args.frozen_snapshot_hash:
             raise CCODRunnerError("worker 启动时冻结包 snapshot 漂移")
-        from algorithms.ccod.cache import CounterfactualLabelCache
         from algorithms.ccod.execution import (
             build_execution_identity,
             execution_identity_hash,
@@ -1184,7 +1485,7 @@ def _worker_main(args: argparse.Namespace) -> int:
         report = execute_state_worker(
             plan,
             args.state_ordinal,
-            CounterfactualLabelCache(cache_dir),
+            _open_label_cache(cache_dir),
             _heartbeat_journal(
                 run,
                 execution_id=args.execution_id,
@@ -1206,7 +1507,7 @@ def _worker_main(args: argparse.Namespace) -> int:
                 "status": "success",
             }
         )
-        _write_json(
+        _write_json_exclusive(
             _worker_report_path(
                 run,
                 args.invocation,
@@ -1242,7 +1543,7 @@ def _worker_main(args: argparse.Namespace) -> int:
                 "peak_rss_mib": _peak_rss_mib(),
             }
             try:
-                _write_json(
+                _write_json_exclusive(
                     _worker_report_path(
                         run,
                         args.invocation,
@@ -1479,6 +1780,27 @@ def _existing_manifest(run_dir: Path) -> Optional[Dict[str, Any]]:
     return payload
 
 
+def _invalid_resume_reason(existing: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """返回不可在同一 run dir 洗白的 invalid 终态原因。"""
+    if existing is None:
+        return None
+    status = existing.get("status")
+    if status not in {"running", "incomplete", "complete", "invalid"}:
+        raise CCODRunnerError("execution manifest status 非法")
+    if status == "invalid":
+        return "execution manifest 已是 invalid"
+    progress = existing.get("state_progress", {})
+    if not isinstance(progress, Mapping):
+        raise CCODRunnerError("execution manifest state_progress 非 object")
+    for state_key, raw in progress.items():
+        if not isinstance(raw, Mapping):
+            raise CCODRunnerError(f"state_progress[{state_key}] 非 object")
+        failure_kind = raw.get("last_failure_kind")
+        if failure_kind in INVALID_FAILURE_KINDS:
+            return f"state {state_key} 已记录 invalid 故障 {failure_kind}"
+    return None
+
+
 def _validate_resumable_manifest(
     existing: Optional[Mapping[str, Any]],
     execution_id: str,
@@ -1497,6 +1819,12 @@ def _validate_resumable_manifest(
         raise CCODRunnerError("运行目录已标记 invalid；必须使用新的 run-dir")
     if status not in {"running", "incomplete", "complete"}:
         raise CCODRunnerError("已有 execution manifest 的 status 非法")
+    invalid_reason = _invalid_resume_reason(existing)
+    if invalid_reason is not None:
+        raise CCODRunnerError(
+            f"运行目录已记录 invalid 终态：{invalid_reason}；"
+            "必须使用新的 run-dir"
+        )
 
 
 def _runtime_drift_error(
@@ -1531,13 +1859,10 @@ def _failure_kind(exc: BaseException) -> str:
     if isinstance(exc, QueryDeadlineExceeded):
         return "query_timeout"
     try:
-        from algorithms.ccod.continuation import CounterfactualError
         from algorithms.ccod.execution import ExecutionIdentityError
 
         if isinstance(exc, ExecutionIdentityError):
             return "identity_mismatch"
-        if isinstance(exc, CounterfactualError):
-            return "cache_corrupt"
     except ImportError:
         pass
     text = f"{type(exc).__name__}: {exc}".lower()
@@ -1550,6 +1875,8 @@ def _failure_kind(exc: BaseException) -> str:
     if "cache" in text and ("corrupt" in text or "哈希" in text or "hash" in text):
         return "cache_corrupt"
     if "identity" in text or "身份" in text:
+        return "identity_mismatch"
+    if "符号链接" in text or "逃逸" in text:
         return "identity_mismatch"
     if "冻结" in text or "frozen" in text:
         return "frozen_drift"
@@ -1565,18 +1892,32 @@ def _terminal_missing_queries(
     cache: Any,
     state_ordinal: int,
     default_kind: str,
-) -> Dict[str, str]:
+    *,
+    attempts_started: int = FROZEN_MAX_ATTEMPTS,
+    state_budget_exhausted: bool = False,
+) -> Dict[str, Dict[str, Any]]:
     """两次尝试耗尽后，仅为该 state 仍缺失/损坏的 query 物化失败。"""
-    failures: Dict[str, str] = {}
+    failures: Dict[str, Dict[str, Any]] = {}
     for query in plan.queries_by_state[state_ordinal]:
         key = str(query["query_key"])
         try:
-            cached = cache.load(_mutable_json_copy(query["query_identity"]))
+            cached = _cache_load(
+                cache,
+                _mutable_json_copy(query["query_identity"]),
+            )
         except Exception:
-            failures[key] = "cache_corrupt"
+            failures[key] = {
+                "failure_kind": "cache_corrupt",
+                "attempts_started": attempts_started,
+                "state_budget_exhausted": state_budget_exhausted,
+            }
             continue
         if cached is None:
-            failures[key] = default_kind
+            failures[key] = {
+                "failure_kind": default_kind,
+                "attempts_started": attempts_started,
+                "state_budget_exhausted": state_budget_exhausted,
+            }
     return failures
 
 
@@ -1616,6 +1957,11 @@ def _restore_state_progress(
         active_attempt = raw.get("active_attempt")
         active_started = raw.get("active_started_unix_ns")
         last_failure = raw.get("last_failure_kind")
+        state_budget_exhausted = raw.get("state_budget_exhausted", False)
+        if not isinstance(state_budget_exhausted, bool):
+            raise CCODRunnerError(
+                f"state_progress[{key}] state_budget_exhausted 非法"
+            )
         if last_failure is not None and last_failure not in (
             RECOVERABLE_FAILURE_KINDS | INVALID_FAILURE_KINDS
         ):
@@ -1637,12 +1983,16 @@ def _restore_state_progress(
             active_started = None
         elif active_started is not None:
             raise CCODRunnerError(f"state_progress[{key}] 孤立 active 时间戳")
+        state_budget_exhausted = (
+            state_budget_exhausted or elapsed >= FROZEN_STATE_TIMEOUT_S
+        )
         progress[key] = {
             "attempts_started": attempts,
             "elapsed_s_hex": elapsed.hex(),
             "active_attempt": active_attempt,
             "active_started_unix_ns": active_started,
             "last_failure_kind": last_failure,
+            "state_budget_exhausted": state_budget_exhausted,
         }
     return progress
 
@@ -1651,14 +2001,19 @@ def _terminal_failures_from_progress(
     plan: Any,
     cache: Any,
     progress: Mapping[str, Mapping[str, Any]],
-) -> Dict[str, str]:
+) -> Dict[str, Dict[str, Any]]:
     """为已耗尽两次尝试且仍缺失的 query 重建稳定失败行。"""
-    failures: Dict[str, str] = {}
+    failures: Dict[str, Dict[str, Any]] = {}
     for state_ordinal in range(len(plan.selected_states)):
         state_progress = progress[str(state_ordinal)]
         attempts = int(state_progress["attempts_started"])
         last_failure = state_progress.get("last_failure_kind")
-        if attempts < FROZEN_MAX_ATTEMPTS and last_failure not in INVALID_FAILURE_KINDS:
+        budget_exhausted = bool(state_progress["state_budget_exhausted"])
+        if (
+            attempts < FROZEN_MAX_ATTEMPTS
+            and not budget_exhausted
+            and last_failure not in INVALID_FAILURE_KINDS
+        ):
             continue
         default_kind = str(
             last_failure or "attempt_exhausted"
@@ -1669,6 +2024,8 @@ def _terminal_failures_from_progress(
                 cache,
                 state_ordinal,
                 default_kind,
+                attempts_started=attempts,
+                state_budget_exhausted=budget_exhausted,
             )
         )
     return failures
@@ -1705,16 +2062,19 @@ def run_diagnostic(
         else REPO_ROOT / "algorithms/ccod/configs/diagnostic_v1.json"
     )
 
-    # verifier 前后绑定同一 runner 快照，防止旧内存代码配上新磁盘哈希。
+    # verifier 前后同时封住冻结树与 runner，阻断验收窗口内的 TOCTOU。
+    frozen_snapshot_before_verification = _frozen_snapshot(frozen)
     runner_hash_before_verification = runner_implementation_hash()
     # 完整 verifier 必须先于任何 Q_H 标签或计划执行。
     from scripts.prepare_ccod_diagnostic import verify_frozen_artifacts
 
     verification = verify_frozen_artifacts(frozen, config_path=config)
+    frozen_snapshot = _frozen_snapshot(frozen)
+    if frozen_snapshot != frozen_snapshot_before_verification:
+        raise CCODRunnerError("verifier 期间冻结包内容发生变化")
     runner_hash = runner_implementation_hash()
     if runner_hash != runner_hash_before_verification:
         raise CCODRunnerError("verifier 期间 runner 源码发生变化")
-    from algorithms.ccod.cache import CounterfactualLabelCache
     from algorithms.ccod.execution import (
         build_execution_identity,
         execution_identity_hash,
@@ -1727,10 +2087,9 @@ def run_diagnostic(
     state_ordinals, _ = execution_prefix(plan, max_states)
     identity = build_execution_identity(plan, runner_implementation_hash=runner_hash)
     execution_id = execution_identity_hash(identity)
-    frozen_snapshot = _frozen_snapshot(frozen)
     existing = _existing_manifest(run) if run.is_dir() else None
     _validate_resumable_manifest(existing, execution_id, identity)
-    cache = CounterfactualLabelCache(cache_path)
+    cache = _open_label_cache(cache_path)
     initially_cached = {
         str(query["query_key"])
         for query in plan.query_rows
@@ -1840,7 +2199,10 @@ def run_diagnostic(
                 continue
             state_progress = progress[str(state_ordinal)]
             attempts_started = int(state_progress["attempts_started"])
-            if attempts_started >= FROZEN_MAX_ATTEMPTS:
+            if (
+                attempts_started >= FROZEN_MAX_ATTEMPTS
+                or state_progress["state_budget_exhausted"]
+            ):
                 continue
             if newly_started_states >= max_new_states:
                 break
@@ -1854,8 +2216,8 @@ def run_diagnostic(
                         "state_timeout",
                         "state 累计 deadline 已耗尽",
                     )
-                    state_progress["attempts_started"] = FROZEN_MAX_ATTEMPTS
                     state_progress["last_failure_kind"] = final_error.failure_kind
+                    state_progress["state_budget_exhausted"] = True
                     _write_json(
                         run / "execution_manifest.json",
                         manifest,
@@ -1898,7 +2260,10 @@ def run_diagnostic(
                         cache,
                         run / "checkpoints",
                     ):
-                        raise CCODRunnerError("worker 成功但父进程复核 cache 不完整")
+                        raise RunnerAttemptError(
+                            "cache_corrupt",
+                            "worker 成功但父进程复核 cache 不完整",
+                        )
                     reports.append(report)
                     final_error = None
                 except RunnerAttemptError as exc:
@@ -1909,9 +2274,20 @@ def run_diagnostic(
                         "父进程收到键盘中断",
                     )
                 except Exception as exc:
-                    final_error = RunnerAttemptError("worker_error", str(exc))
+                    final_error = RunnerAttemptError(
+                        _failure_kind(exc),
+                        str(exc),
+                    )
                 finally:
                     updated_elapsed = elapsed + (time.monotonic() - attempt_started)
+                    budget_exhausted = bool(
+                        state_progress["state_budget_exhausted"]
+                    ) or updated_elapsed >= FROZEN_STATE_TIMEOUT_S
+                    if (
+                        final_error is not None
+                        and final_error.failure_kind == "state_timeout"
+                    ):
+                        budget_exhausted = True
                     state_progress.update(
                         {
                             "elapsed_s_hex": updated_elapsed.hex(),
@@ -1922,6 +2298,7 @@ def run_diagnostic(
                                 if final_error is not None
                                 else None
                             ),
+                            "state_budget_exhausted": budget_exhausted,
                         }
                     )
                     _write_json(

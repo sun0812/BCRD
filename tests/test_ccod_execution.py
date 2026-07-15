@@ -545,6 +545,9 @@ class SignalGateTest(unittest.TestCase):
                 rows[0].pop("result")
                 rows[0]["status"] = "failed"
                 rows[0]["failure_kind"] = failure_kind
+                rows[0]["attempts_started"] = 2
+                rows[0]["attempt_budget"] = 2
+                rows[0]["state_budget_exhausted"] = False
                 summary = summarize_signal_gate(self.plan, self.identity, rows)
                 self.assertEqual(summary["execution_status"], "incomplete")
                 self.assertEqual(summary["signal_gate"], "not_evaluated")
@@ -565,6 +568,9 @@ class SignalGateTest(unittest.TestCase):
                 rows[0].pop("result")
                 rows[0]["status"] = "failed"
                 rows[0]["failure_kind"] = failure_kind
+                rows[0]["attempts_started"] = 1
+                rows[0]["attempt_budget"] = 2
+                rows[0]["state_budget_exhausted"] = False
                 summary = summarize_signal_gate(self.plan, self.identity, rows)
                 self.assertEqual(summary["execution_status"], "invalid")
                 self.assertEqual(summary["signal_gate"], "not_evaluated")
@@ -679,6 +685,9 @@ class SignalGateTest(unittest.TestCase):
                     "state_hash": query["state_hash"],
                     "status": "failed",
                     "failure_kind": "query_timeout",
+                    "attempts_started": 2,
+                    "attempt_budget": 2,
+                    "state_budget_exhausted": False,
                 }
             ],
         )
@@ -687,6 +696,27 @@ class SignalGateTest(unittest.TestCase):
         self.assertIsNone(failed["passed"])
         self.assertEqual(failed["failed_queries"], 1)
         self.assertEqual(failed["failure_counts"], {"query_timeout": 1})
+
+    def test_recoverable_failure_requires_real_terminal_evidence(self) -> None:
+        """未启动的第二次尝试不能被伪造成已耗尽；state deadline 可单独终止。"""
+        query = self.plan.query_rows[0]
+        base = {
+            "execution_id": self.execution_id,
+            "run_id": self.plan.run_id,
+            "query_key": query["query_key"],
+            "query_ordinal": query["query_ordinal"],
+            "state_hash": query["state_hash"],
+            "status": "failed",
+            "failure_kind": "state_timeout",
+            "attempts_started": 1,
+            "attempt_budget": 2,
+            "state_budget_exhausted": False,
+        }
+        with self.assertRaisesRegex(CCODExecutionError, "终止边界"):
+            summarize_signal_gate(self.plan, self.identity, [base])
+        base["state_budget_exhausted"] = True
+        summary = summarize_signal_gate(self.plan, self.identity, [base])
+        self.assertEqual(summary["execution_status"], "incomplete")
 
     def test_nested_operational_metadata_is_rejected(self) -> None:
         """运行元数据不得混入稳定 result_hash 并污染科学哈希。"""

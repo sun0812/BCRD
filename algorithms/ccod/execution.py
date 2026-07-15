@@ -27,6 +27,7 @@ SCIENTIFIC_LABELS_SCHEMA_VERSION = "eosbench-ccod-scientific-labels-v1"
 
 FROZEN_STATE_COUNT = 100
 FROZEN_QUERY_COUNT = 1570
+FROZEN_MAX_ATTEMPTS = 2
 QUERY_BUDGET_PER_STATE = 16
 SIGNAL_MIN_CANDIDATES = 10
 SIGNAL_SPREAD_THRESHOLD = 0.01
@@ -42,7 +43,7 @@ _FROZEN_RUNTIME = {
 }
 _FROZEN_GUARDS = {
     "workers": 1,
-    "max_attempts": 2,
+    "max_attempts": FROZEN_MAX_ATTEMPTS,
     "query_timeout_s": 120.0,
     "state_timeout_s": 1200.0,
     "worker_peak_rss_limit_mib": 6144.0,
@@ -673,10 +674,32 @@ def _index_query_results(
                 raise CCODExecutionError("failed query 必须记录 failure_kind")
             if "result" in result_row:
                 raise CCODExecutionError("failed query 不得携带 cache result")
-            if str(result_row["failure_kind"]) not in (
+            failure_kind = str(result_row["failure_kind"])
+            if failure_kind not in (
                 _RECOVERABLE_FAILURE_KINDS | _INVALID_FAILURE_KINDS
             ):
                 raise CCODExecutionError("failed query 含未知 failure_kind")
+            attempts_started = result_row.get("attempts_started")
+            attempt_budget = result_row.get("attempt_budget")
+            state_budget_exhausted = result_row.get(
+                "state_budget_exhausted"
+            )
+            if (
+                isinstance(attempts_started, bool)
+                or not isinstance(attempts_started, int)
+                or not (0 <= attempts_started <= FROZEN_MAX_ATTEMPTS)
+                or attempt_budget != FROZEN_MAX_ATTEMPTS
+                or not isinstance(state_budget_exhausted, bool)
+            ):
+                raise CCODExecutionError("failed query 的 attempt 证据非法")
+            if (
+                failure_kind in _RECOVERABLE_FAILURE_KINDS
+                and attempts_started < FROZEN_MAX_ATTEMPTS
+                and not state_budget_exhausted
+            ):
+                raise CCODExecutionError(
+                    "可恢复 failed query 尚未达到 attempt 或 state 终止边界"
+                )
             q_value, result_hash = None, None
         else:
             raise CCODExecutionError("query result status 只允许 success/failed")
