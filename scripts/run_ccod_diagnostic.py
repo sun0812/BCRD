@@ -208,8 +208,7 @@ def _reject_symlink_components(path: Path, *, label: str) -> None:
     system_aliases = {Path("/tmp"), Path("/var"), Path("/etc")}
     while True:
         if (
-            cursor.exists()
-            and cursor.is_symlink()
+            cursor.is_symlink()
             and cursor not in system_aliases
         ):
             raise CCODRunnerError(f"{label} 不允许符号链接组件: {cursor}")
@@ -1011,10 +1010,29 @@ def _heartbeat_journal(
             f"invocation_{invocation:03d}_state_{state_ordinal:03d}"
             f"_attempt_{attempt}.journal.jsonl"
         )
-    ).resolve(strict=False)
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        raise CCODRunnerError(f"worker journal 已存在，拒绝覆盖: {path}")
+    if path.is_symlink():
+        raise CCODRunnerError(f"worker journal 不允许符号链接: {path}")
+    create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    append_flags = os.O_WRONLY | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        create_flags |= os.O_NOFOLLOW
+        append_flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, create_flags, 0o600)
+    except FileExistsError as exc:
+        raise CCODRunnerError(
+            f"worker journal 已存在，拒绝覆盖: {path}"
+        ) from exc
+    except OSError as exc:
+        raise CCODRunnerError(f"无法创建 worker journal: {exc}") from exc
+    try:
+        created_stat = os.fstat(descriptor)
+        journal_identity = (created_stat.st_dev, created_stat.st_ino)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     latest_path = worker_dir / (
         f"invocation_{invocation:03d}_state_{state_ordinal:03d}.heartbeat.json"
     )
@@ -1033,14 +1051,25 @@ def _heartbeat_journal(
             "details": dict(details),
         }
         sequence += 1
+        descriptor: Optional[int] = None
         try:
-            with path.open("ab") as handle:
+            descriptor = os.open(path, append_flags)
+            current_stat = os.fstat(descriptor)
+            if (current_stat.st_dev, current_stat.st_ino) != journal_identity:
+                raise CCODRunnerError("worker journal 文件身份发生变化")
+            with os.fdopen(descriptor, "ab", closefd=True) as handle:
+                descriptor = None
                 handle.write(_canonical_bytes(record) + b"\n")
                 handle.flush()
                 os.fsync(handle.fileno())
             _write_json(latest_path, record, "heartbeat_hash")
+        except CCODRunnerError:
+            raise
         except OSError as exc:
             raise CCODRunnerError(f"无法写入 worker journal: {exc}") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     return emit
 
@@ -1386,11 +1415,28 @@ def _launch_state_attempt(
         stderr=subprocess.PIPE,
         text=True,
     )
-    outcome = monitor_worker(
-        process,
-        remaining_state_s=remaining_state_s,
-        rss_limit_mib=FROZEN_RSS_LIMIT_MIB,
-    )
+    try:
+        outcome = monitor_worker(
+            process,
+            remaining_state_s=remaining_state_s,
+            rss_limit_mib=FROZEN_RSS_LIMIT_MIB,
+        )
+    except BaseException:
+        # KeyboardInterrupt、监控器异常或父进程取消都必须先回收一次性 worker；
+        # 否则旧进程可能在下一 invocation 中继续写同一内容缓存。
+        try:
+            _terminate_worker(process)
+        except Exception:
+            try:
+                process.kill()
+                process.wait(timeout=2.0)
+            except Exception:
+                pass
+        try:
+            process.communicate(timeout=2.0)
+        except Exception:
+            pass
+        raise
     if outcome.violation is not None:
         failure_kind = {
             "state_timeout": "state_timeout",
@@ -1431,6 +1477,51 @@ def _existing_manifest(run_dir: Path) -> Optional[Dict[str, Any]]:
     if stored != _sha256_json(unhashed):
         raise CCODRunnerError("已有 execution manifest 内容哈希不一致")
     return payload
+
+
+def _validate_resumable_manifest(
+    existing: Optional[Mapping[str, Any]],
+    execution_id: str,
+    identity: Mapping[str, Any],
+) -> None:
+    """验证运行目录身份，并令 invalid 状态在同一目录永久粘住。"""
+    if existing is None:
+        return
+    if (
+        existing.get("execution_id") != execution_id
+        or existing.get("execution_identity") != identity
+    ):
+        raise CCODRunnerError("运行目录属于不同 execution identity")
+    status = existing.get("status")
+    if status == "invalid":
+        raise CCODRunnerError("运行目录已标记 invalid；必须使用新的 run-dir")
+    if status not in {"running", "incomplete", "complete"}:
+        raise CCODRunnerError("已有 execution manifest 的 status 非法")
+
+
+def _runtime_drift_error(
+    frozen_dir: Path,
+    frozen_snapshot: Mapping[str, Any],
+    runner_hash: str,
+) -> Optional[RunnerAttemptError]:
+    """复核冻结树与实现指纹，返回不可恢复的漂移证据。"""
+    try:
+        if _frozen_snapshot(frozen_dir) != frozen_snapshot:
+            return RunnerAttemptError(
+                "frozen_drift",
+                "执行期间冻结包内容发生变化",
+            )
+    except Exception as exc:
+        return RunnerAttemptError("frozen_drift", f"无法复核冻结包: {exc}")
+    try:
+        if runner_implementation_hash() != runner_hash:
+            return RunnerAttemptError(
+                "runner_drift",
+                "执行期间 runner 源码发生变化",
+            )
+    except Exception as exc:
+        return RunnerAttemptError("runner_drift", f"无法复核 runner: {exc}")
+    return None
 
 
 def _failure_kind(exc: BaseException) -> str:
@@ -1638,11 +1729,7 @@ def run_diagnostic(
     execution_id = execution_identity_hash(identity)
     frozen_snapshot = _frozen_snapshot(frozen)
     existing = _existing_manifest(run) if run.is_dir() else None
-    if existing is not None and (
-        existing.get("execution_id") != execution_id
-        or existing.get("execution_identity") != identity
-    ):
-        raise CCODRunnerError("运行目录属于不同 execution identity")
+    _validate_resumable_manifest(existing, execution_id, identity)
     cache = CounterfactualLabelCache(cache_path)
     initially_cached = {
         str(query["query_key"])
@@ -1659,6 +1746,9 @@ def run_diagnostic(
             {},
         )
         summary = summarize_signal_gate(plan, identity, rows)
+        drift_error = _runtime_drift_error(frozen, frozen_snapshot, runner_hash)
+        if drift_error is not None:
+            raise CCODRunnerError(str(drift_error))
         return {
             "schema_version": RUNNER_SCHEMA_VERSION,
             "execution_id": execution_id,
@@ -1680,12 +1770,11 @@ def run_diagnostic(
     run_lock = _acquire_run_lock(run, execution_id)
     # 上锁后重新读取，避免两个父进程在只读预检与写清单之间发生 TOCTOU。
     existing = _existing_manifest(run)
-    if existing is not None and (
-        existing.get("execution_id") != execution_id
-        or existing.get("execution_identity") != identity
-    ):
+    try:
+        _validate_resumable_manifest(existing, execution_id, identity)
+    except Exception:
         run_lock.close()
-        raise CCODRunnerError("运行目录属于不同 execution identity")
+        raise
     if existing is None:
         unexpected = [
             path
@@ -1871,16 +1960,9 @@ def run_diagnostic(
         except Exception as exc:
             if pending_error is None:
                 pending_error = RunnerAttemptError("cache_corrupt", str(exc))
-        if _frozen_snapshot(frozen) != frozen_snapshot:
-            pending_error = RunnerAttemptError(
-                "frozen_drift",
-                "执行期间冻结包内容发生变化",
-            )
-        if runner_implementation_hash() != runner_hash:
-            pending_error = RunnerAttemptError(
-                "runner_drift",
-                "执行期间 runner 源码发生变化",
-            )
+        drift_error = _runtime_drift_error(frozen, frozen_snapshot, runner_hash)
+        if drift_error is not None:
+            pending_error = drift_error
         successful_rows = [row for row in rows if row.get("status") == "success"]
         successful_keys = {str(row["query_key"]) for row in successful_rows}
         completed_states = sum(
@@ -1913,6 +1995,32 @@ def run_diagnostic(
                 summary = summarize_signal_gate(plan, identity, rows)
             _write_jsonl(run / "query_results.jsonl", rows)
             _write_json(run / "signal_summary.json", summary, "summary_hash")
+            # gate 计算和结果写入期间也可能发生漂移；完整结果发布前再检查一次。
+            if pending_error is None or pending_error.recoverable:
+                late_drift = _runtime_drift_error(
+                    frozen,
+                    frozen_snapshot,
+                    runner_hash,
+                )
+                if late_drift is not None:
+                    pending_error = late_drift
+                    summary.update(
+                        {
+                            "execution_status": "invalid",
+                            "status": "invalid",
+                            "signal_gate": "not_evaluated",
+                            "decision": "not_evaluated",
+                            "method_decision": None,
+                            "passed": None,
+                            "failure_counts": {late_drift.failure_kind: 1},
+                            "scientific_results_hash": None,
+                        }
+                    )
+                    _write_json(
+                        run / "signal_summary.json",
+                        summary,
+                        "summary_hash",
+                    )
         except Exception as exc:
             if pending_error is None:
                 pending_error = RunnerAttemptError("cache_corrupt", str(exc))

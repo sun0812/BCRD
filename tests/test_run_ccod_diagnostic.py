@@ -21,6 +21,7 @@ from scripts.run_ccod_diagnostic import (
     RunnerAttemptError,
     _acquire_run_lock,
     _heartbeat_journal,
+    _launch_state_attempt,
     _result_rows_from_cache,
     _restore_state_progress,
     _terminal_missing_queries,
@@ -642,6 +643,59 @@ class GuardTest(unittest.TestCase):
             self.assertIn("invocation_001", journals[0].name)
             self.assertIn("invocation_002", journals[1].name)
 
+    def test_broken_worker_symlink_cannot_escape_run_tree(self) -> None:
+        """即使链接目标不存在，worker 目录也不得把 journal 引到树外。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            run = root / "run"
+            run.mkdir()
+            outside = root / "outside" / "missing-workers"
+            (run / "workers").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(CCODRunnerError, "符号链接"):
+                _heartbeat_journal(
+                    run,
+                    execution_id=EXECUTION_ID,
+                    invocation=1,
+                    state_ordinal=0,
+                    attempt=1,
+                )
+            self.assertFalse(outside.exists())
+
+    def test_parent_interrupt_reaps_spawned_worker(self) -> None:
+        """监控阶段中断必须终止并回收 worker，不能留给下一 invocation。"""
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        process.communicate.return_value = ("", "")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            run = root / "run"
+            run.mkdir()
+            with mock.patch(
+                "scripts.run_ccod_diagnostic.subprocess.Popen",
+                return_value=process,
+            ), mock.patch(
+                "scripts.run_ccod_diagnostic.monitor_worker",
+                side_effect=KeyboardInterrupt,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    _launch_state_attempt(
+                        frozen_dir=root / "frozen",
+                        run_dir=run,
+                        cache_dir=root / "cache",
+                        config_path=root / "config.json",
+                        invocation=1,
+                        state_ordinal=0,
+                        attempt=1,
+                        remaining_state_s=1.0,
+                        execution_id=EXECUTION_ID,
+                        runner_hash="sha256:" + "90" * 32,
+                        frozen_snapshot_hash="sha256:" + "ab" * 32,
+                    )
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called()
+        process.communicate.assert_called_with(timeout=2.0)
+
     def test_worker_report_rejects_wrong_invocation(self) -> None:
         """final report 必须绑定当前 invocation。"""
         payload = {
@@ -858,6 +912,32 @@ class ParentOrchestrationTest(unittest.TestCase):
         self.assertTrue(result["verify_only"])
         self.assertEqual(result["writes_performed"], 0)
 
+    def test_verify_only_rejects_end_of_read_drift(self) -> None:
+        """只读 cache 扫描结束也必须重新绑定同一冻结快照。"""
+        plan = _plan(query_count=1)
+        cache = _FakeCache()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            frozen = root / "frozen"
+            run = root / "run"
+            frozen.mkdir()
+            stack, launcher = self._patch_parent(plan, cache)
+            with stack, mock.patch(
+                "scripts.run_ccod_diagnostic._frozen_snapshot",
+                side_effect=[
+                    {"snapshot_hash": "sha256:" + "ab" * 32},
+                    {"snapshot_hash": "sha256:" + "ac" * 32},
+                ],
+            ):
+                with self.assertRaisesRegex(CCODRunnerError, "冻结包"):
+                    run_diagnostic(
+                        frozen_dir=frozen,
+                        run_dir=run,
+                        verify_only=True,
+                    )
+            self.assertFalse(run.exists())
+        launcher.assert_not_called()
+
     def test_all_cache_hits_skip_parent_spawn(self) -> None:
         plan = _plan(query_count=2)
         cache = _FakeCache(
@@ -908,6 +988,54 @@ class ParentOrchestrationTest(unittest.TestCase):
         self.assertEqual(result["signal_gate"], "not_evaluated")
         self.assertIsNone(result["method_decision"])
         self.assertEqual(summary["execution_status"], "invalid")
+
+    def test_drift_during_gate_write_suppresses_complete_manifest(self) -> None:
+        """初次复核通过后发生的漂移也不能留下 complete manifest。"""
+        plan = _plan(query_count=1)
+        query = plan.query_rows[0]
+        cache = _FakeCache(
+            {query["query_key"]: _FakeResult(query["query_key"]).to_manifest()}
+        )
+        same = {"snapshot_hash": "sha256:" + "ab" * 32}
+        changed = {"snapshot_hash": "sha256:" + "ac" * 32}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            frozen = root / "frozen"
+            run = root / "run"
+            frozen.mkdir()
+            stack, launcher = self._patch_parent(plan, cache)
+            with stack, mock.patch(
+                "scripts.run_ccod_diagnostic._frozen_snapshot",
+                side_effect=[same, same, changed],
+            ):
+                result = run_diagnostic(frozen_dir=frozen, run_dir=run)
+        launcher.assert_not_called()
+        self.assertEqual(result["status"], "invalid")
+        self.assertEqual(result["signal_gate"], "not_evaluated")
+
+    def test_invalid_run_directory_cannot_be_resumed(self) -> None:
+        """invalid 是粘性终态，修复后必须换 run-dir 保留原始证据。"""
+        plan = _plan(query_count=1)
+        cache = _FakeCache()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            frozen = root / "frozen"
+            run = root / "run"
+            frozen.mkdir()
+            stack, launcher = self._patch_parent(plan, cache)
+            launcher.side_effect = RunnerAttemptError(
+                "identity_mismatch",
+                "合成身份冲突",
+            )
+            with stack:
+                first = run_diagnostic(frozen_dir=frozen, run_dir=run)
+            self.assertEqual(first["status"], "invalid")
+
+            stack, second_launcher = self._patch_parent(plan, cache)
+            with stack, self.assertRaisesRegex(CCODRunnerError, "新的 run-dir"):
+                run_diagnostic(frozen_dir=frozen, run_dir=run)
+        self.assertEqual(launcher.call_count, 1)
+        second_launcher.assert_not_called()
 
     def test_default_starts_only_first_incomplete_state(self) -> None:
         plan = _multi_plan(2)
