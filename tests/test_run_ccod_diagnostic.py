@@ -410,22 +410,46 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(parsed.invocation, 1)
         self.assertEqual(parsed.state_ordinal, 0)
         self.assertEqual(parsed.attempt, 1)
+        self.assertEqual(parsed.query_timeout_s, 120.0)
+
+    def test_parser_rejects_nonfinite_query_timeout(self) -> None:
+        """内部 deadline 参数也不得接受 NaN/Inf。"""
+        parser = build_parser()
+        for raw in ("nan", "inf", "-inf"):
+            with self.subTest(raw=raw), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(
+                        [
+                            "--frozen-dir",
+                            "/tmp/frozen",
+                            "--run-dir",
+                            "/tmp/run",
+                            "--query-timeout-s",
+                            raw,
+                        ]
+                    )
 
     def test_worker_final_report_requires_bounded_finite_rss(self) -> None:
         base = {
             "schema_version": "eosbench-ccod-worker-report-v1",
             "execution_id": EXECUTION_ID,
+            "runner_implementation_hash": "sha256:" + "90" * 32,
+            "frozen_snapshot_hash": "sha256:" + "ab" * 32,
             "invocation": 1,
             "state_ordinal": 0,
             "attempt": 1,
             "status": "success",
+            "restored": False,
+            "planned_queries": 1,
+            "cache_hits": 1,
+            "evaluated_queries": 0,
+            "fresh_query_keys": [],
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "report.json"
             for peak_rss in (None, 6144.1):
                 payload = dict(base)
-                if peak_rss is not None:
-                    payload["peak_rss_mib"] = peak_rss
+                payload["peak_rss_mib"] = peak_rss
                 payload["report_hash"] = sha256_json(payload)
                 path.write_text(
                     json.dumps(payload, ensure_ascii=False) + "\n",
@@ -435,6 +459,8 @@ class GuardTest(unittest.TestCase):
                     _verify_worker_report(
                         path,
                         execution_id=EXECUTION_ID,
+                        runner_hash="sha256:" + "90" * 32,
+                        frozen_snapshot_hash="sha256:" + "ab" * 32,
                         invocation=1,
                         state_ordinal=0,
                         attempt=1,
@@ -519,6 +545,73 @@ class GuardTest(unittest.TestCase):
             self.assertEqual(returncode, 1)
             self.assertFalse((run / "workers").exists())
 
+    def test_hidden_worker_binds_timeout_state_attempt_and_paths(self) -> None:
+        """手工 worker 不得绕过冻结 deadline 或父进程授权坐标。"""
+        cases = (
+            ("timeout", {"query_timeout_s": 119.0}, "query timeout"),
+            ("state", {"state_ordinal": 1}, "授权前缀"),
+            ("attempt", {"attempt": 2}, "active"),
+            ("paths", {"use_other_cache": True}, "路径"),
+        )
+        for name, overrides, expected_error in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                frozen = root / "frozen"
+                run = root / "run"
+                cache = run / "cache"
+                frozen.mkdir()
+                run.mkdir()
+                parent_manifest = {
+                    "schema_version": "eosbench-ccod-runner-v1",
+                    "execution_id": EXECUTION_ID,
+                    "execution_identity": {
+                        "runner_implementation_hash": "sha256:" + "90" * 32,
+                    },
+                    "frozen_snapshot_hash": "sha256:" + "ab" * 32,
+                    "paths": {
+                        "frozen_dir": str(frozen),
+                        "run_dir": str(run),
+                        "cache_dir": str(cache),
+                    },
+                    "invocation": 1,
+                    "state_ordinals_this_invocation": [0],
+                    "state_progress": {
+                        "0": {
+                            "attempts_started": 1,
+                            "active_attempt": 1,
+                            "active_started_unix_ns": 1,
+                        }
+                    },
+                    "status": "running",
+                }
+                parent_manifest["manifest_hash"] = sha256_json(parent_manifest)
+                (run / "execution_manifest.json").write_text(
+                    json.dumps(parent_manifest, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                args = SimpleNamespace(
+                    frozen_dir=frozen,
+                    run_dir=run,
+                    cache_dir=(
+                        run / "other-cache"
+                        if overrides.get("use_other_cache")
+                        else cache
+                    ),
+                    state_ordinal=overrides.get("state_ordinal", 0),
+                    attempt=overrides.get("attempt", 1),
+                    query_timeout_s=overrides.get("query_timeout_s", 120.0),
+                    execution_id=EXECUTION_ID,
+                    invocation=1,
+                    runner_hash="sha256:" + "90" * 32,
+                    frozen_snapshot_hash="sha256:" + "ab" * 32,
+                )
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    returncode = _worker_main(args)
+                self.assertEqual(returncode, 1)
+                self.assertIn(expected_error, stderr.getvalue())
+                self.assertFalse((run / "workers").exists())
+
     def test_invocation_evidence_paths_coexist_and_refuse_overwrite(self) -> None:
         """跨 invocation 证据共存，同坐标 journal 不得覆盖。"""
         with tempfile.TemporaryDirectory() as directory:
@@ -554,10 +647,17 @@ class GuardTest(unittest.TestCase):
         payload = {
             "schema_version": "eosbench-ccod-worker-report-v1",
             "execution_id": EXECUTION_ID,
+            "runner_implementation_hash": "sha256:" + "90" * 32,
+            "frozen_snapshot_hash": "sha256:" + "ab" * 32,
             "invocation": 2,
             "state_ordinal": 0,
             "attempt": 1,
             "status": "success",
+            "restored": False,
+            "planned_queries": 1,
+            "cache_hits": 1,
+            "evaluated_queries": 0,
+            "fresh_query_keys": [],
             "peak_rss_mib": 64.0,
         }
         payload["report_hash"] = sha256_json(payload)
@@ -571,10 +671,68 @@ class GuardTest(unittest.TestCase):
                 _verify_worker_report(
                     path,
                     execution_id=EXECUTION_ID,
+                    runner_hash="sha256:" + "90" * 32,
+                    frozen_snapshot_hash="sha256:" + "ab" * 32,
                     invocation=1,
                     state_ordinal=0,
                     attempt=1,
                 )
+
+    def test_worker_report_requires_full_schema_and_provenance(self) -> None:
+        """哈希正确也不能接受缺字段、额外字段或错误来源。"""
+        base = {
+            "schema_version": "eosbench-ccod-worker-report-v1",
+            "execution_id": EXECUTION_ID,
+            "runner_implementation_hash": "sha256:" + "90" * 32,
+            "frozen_snapshot_hash": "sha256:" + "ab" * 32,
+            "invocation": 1,
+            "state_ordinal": 0,
+            "attempt": 1,
+            "status": "success",
+            "restored": False,
+            "planned_queries": 1,
+            "cache_hits": 1,
+            "evaluated_queries": 0,
+            "fresh_query_keys": [],
+            "peak_rss_mib": 64.0,
+        }
+        mutations = (
+            ("missing_schema", lambda row: row.pop("schema_version")),
+            (
+                "wrong_runner",
+                lambda row: row.__setitem__(
+                    "runner_implementation_hash", "sha256:" + "91" * 32
+                ),
+            ),
+            (
+                "wrong_snapshot",
+                lambda row: row.__setitem__(
+                    "frozen_snapshot_hash", "sha256:" + "ac" * 32
+                ),
+            ),
+            ("extra", lambda row: row.__setitem__("unexpected", True)),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            for name, mutate in mutations:
+                with self.subTest(name=name):
+                    payload = dict(base)
+                    mutate(payload)
+                    payload["report_hash"] = sha256_json(payload)
+                    path.write_text(
+                        json.dumps(payload, ensure_ascii=False) + "\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(CCODRunnerError):
+                        _verify_worker_report(
+                            path,
+                            execution_id=EXECUTION_ID,
+                            runner_hash="sha256:" + "90" * 32,
+                            frozen_snapshot_hash="sha256:" + "ab" * 32,
+                            invocation=1,
+                            state_ordinal=0,
+                            attempt=1,
+                        )
 
 
 class ParentOrchestrationTest(unittest.TestCase):

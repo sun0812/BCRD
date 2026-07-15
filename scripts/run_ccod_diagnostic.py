@@ -52,6 +52,45 @@ CHECKPOINT_SCHEMA_VERSION = "eosbench-ccod-state-checkpoint-v1"
 WORKER_REPORT_SCHEMA_VERSION = "eosbench-ccod-worker-report-v1"
 RUNNER_IMPLEMENTATION_SCHEMA_VERSION = "eosbench-ccod-runner-implementation-v1"
 
+# final report 是跨进程运行证据，必须用精确字段集阻止旧 worker 或额外
+# 未受审计元数据混入 manifest。
+_WORKER_SUCCESS_FIELDS = frozenset(
+    {
+        "schema_version",
+        "execution_id",
+        "runner_implementation_hash",
+        "frozen_snapshot_hash",
+        "invocation",
+        "state_ordinal",
+        "attempt",
+        "status",
+        "restored",
+        "planned_queries",
+        "cache_hits",
+        "evaluated_queries",
+        "fresh_query_keys",
+        "peak_rss_mib",
+        "report_hash",
+    }
+)
+_WORKER_FAILURE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "execution_id",
+        "runner_implementation_hash",
+        "frozen_snapshot_hash",
+        "invocation",
+        "state_ordinal",
+        "attempt",
+        "status",
+        "failure_kind",
+        "error_type",
+        "error_message",
+        "peak_rss_mib",
+        "report_hash",
+    }
+)
+
 FROZEN_PYTHON = (3, 10, 20)
 FROZEN_WORKERS = 1
 FROZEN_MAX_ATTEMPTS = 2
@@ -1029,6 +1068,23 @@ def _worker_main(args: argparse.Namespace) -> int:
             or args.invocation <= 0
         ):
             raise CCODRunnerError("worker invocation 非法")
+        if (
+            isinstance(args.state_ordinal, bool)
+            or not isinstance(args.state_ordinal, int)
+            or args.state_ordinal < 0
+            or isinstance(args.attempt, bool)
+            or not isinstance(args.attempt, int)
+            or not (1 <= args.attempt <= FROZEN_MAX_ATTEMPTS)
+        ):
+            raise CCODRunnerError("worker state/attempt 坐标非法")
+        timeout = args.query_timeout_s
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or float(timeout).hex() != FROZEN_QUERY_TIMEOUT_S.hex()
+        ):
+            raise CCODRunnerError("worker query timeout 偏离冻结的 120 秒")
         manifest_invocation = manifest.get("invocation")
         if (
             manifest.get("status") != "running"
@@ -1040,6 +1096,41 @@ def _worker_main(args: argparse.Namespace) -> int:
             or manifest_invocation != args.invocation
         ):
             raise CCODRunnerError("worker 无法绑定父进程已验收的运行身份")
+        expected_paths = {
+            "frozen_dir": str(frozen),
+            "run_dir": str(run),
+            "cache_dir": str(cache_dir),
+        }
+        if manifest.get("paths") != expected_paths:
+            raise CCODRunnerError("worker 路径与父进程 execution manifest 不一致")
+        allowed_states = manifest.get("state_ordinals_this_invocation")
+        if (
+            not isinstance(allowed_states, list)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in allowed_states
+            )
+            or len(set(allowed_states)) != len(allowed_states)
+            or args.state_ordinal not in allowed_states
+        ):
+            raise CCODRunnerError("worker state 不在本次 invocation 授权前缀内")
+        state_progress = manifest.get("state_progress")
+        active_progress = (
+            state_progress.get(str(args.state_ordinal))
+            if isinstance(state_progress, Mapping)
+            else None
+        )
+        if (
+            not isinstance(active_progress, Mapping)
+            or active_progress.get("active_attempt") != args.attempt
+            or active_progress.get("attempts_started") != args.attempt
+            or isinstance(active_progress.get("active_started_unix_ns"), bool)
+            or not isinstance(active_progress.get("active_started_unix_ns"), int)
+            or int(active_progress["active_started_unix_ns"]) <= 0
+        ):
+            raise CCODRunnerError("worker attempt 未绑定父进程当前 active 状态")
         if _frozen_snapshot(frozen).get("snapshot_hash") != args.frozen_snapshot_hash:
             raise CCODRunnerError("worker 启动时冻结包 snapshot 漂移")
         from algorithms.ccod.cache import CounterfactualLabelCache
@@ -1079,6 +1170,8 @@ def _worker_main(args: argparse.Namespace) -> int:
             {
                 "schema_version": WORKER_REPORT_SCHEMA_VERSION,
                 "execution_id": args.execution_id,
+                "runner_implementation_hash": args.runner_hash,
+                "frozen_snapshot_hash": args.frozen_snapshot_hash,
                 "invocation": args.invocation,
                 "attempt": args.attempt,
                 "status": "success",
@@ -1108,6 +1201,8 @@ def _worker_main(args: argparse.Namespace) -> int:
             failure = {
                 "schema_version": WORKER_REPORT_SCHEMA_VERSION,
                 "execution_id": args.execution_id,
+                "runner_implementation_hash": args.runner_hash,
+                "frozen_snapshot_hash": args.frozen_snapshot_hash,
                 "invocation": args.invocation,
                 "state_ordinal": args.state_ordinal,
                 "attempt": args.attempt,
@@ -1139,6 +1234,8 @@ def _verify_worker_report(
     path: Path,
     *,
     execution_id: str,
+    runner_hash: str,
+    frozen_snapshot_hash: str,
     invocation: int,
     state_ordinal: int,
     attempt: int,
@@ -1151,8 +1248,25 @@ def _verify_worker_report(
     unhashed = {key: value for key, value in payload.items() if key != "report_hash"}
     if stored != _sha256_json(unhashed):
         raise RunnerAttemptError("hash_mismatch", "worker final report 内容哈希不一致")
+    if payload.get("schema_version") != WORKER_REPORT_SCHEMA_VERSION:
+        raise RunnerAttemptError("identity_mismatch", "worker final report schema 不一致")
+    status = payload.get("status")
+    expected_fields = (
+        _WORKER_SUCCESS_FIELDS
+        if status == "success"
+        else _WORKER_FAILURE_FIELDS
+        if status == "failed"
+        else None
+    )
+    if expected_fields is None or set(payload) != expected_fields:
+        raise RunnerAttemptError(
+            "identity_mismatch",
+            "worker final report status 或字段集非法",
+        )
     if (
         payload.get("execution_id") != execution_id
+        or payload.get("runner_implementation_hash") != runner_hash
+        or payload.get("frozen_snapshot_hash") != frozen_snapshot_hash
         or payload.get("invocation") != invocation
         or payload.get("state_ordinal") != state_ordinal
         or payload.get("attempt") != attempt
@@ -1175,7 +1289,6 @@ def _verify_worker_report(
             else "worker_error",
             "worker final report 缺少合规 peak_rss_mib",
         )
-    status = payload.get("status")
     if status == "failed":
         failure_kind = payload.get("failure_kind")
         if failure_kind not in RECOVERABLE_FAILURE_KINDS | INVALID_FAILURE_KINDS:
@@ -1192,6 +1305,32 @@ def _verify_worker_report(
         raise RunnerAttemptError(
             "identity_mismatch",
             "worker final report status 非法",
+        )
+    restored = payload.get("restored")
+    planned = payload.get("planned_queries")
+    cache_hits = payload.get("cache_hits")
+    evaluated = payload.get("evaluated_queries")
+    fresh_keys = payload.get("fresh_query_keys")
+    if (
+        not isinstance(restored, bool)
+        or isinstance(planned, bool)
+        or not isinstance(planned, int)
+        or planned <= 0
+        or isinstance(cache_hits, bool)
+        or not isinstance(cache_hits, int)
+        or cache_hits < 0
+        or isinstance(evaluated, bool)
+        or not isinstance(evaluated, int)
+        or evaluated < 0
+        or cache_hits + evaluated != planned
+        or not isinstance(fresh_keys, list)
+        or len(fresh_keys) != evaluated
+        or any(not isinstance(key, str) or not key for key in fresh_keys)
+        or len(set(fresh_keys)) != len(fresh_keys)
+    ):
+        raise RunnerAttemptError(
+            "identity_mismatch",
+            "worker success report 查询计数非法",
         )
     return payload
 
@@ -1266,6 +1405,8 @@ def _launch_state_attempt(
         return _verify_worker_report(
             report_path,
             execution_id=execution_id,
+            runner_hash=runner_hash,
+            frozen_snapshot_hash=frozen_snapshot_hash,
             invocation=invocation,
             state_ordinal=state_ordinal,
             attempt=attempt,
@@ -1828,8 +1969,8 @@ def _positive_float(text: str) -> float:
         value = float(text)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("必须为数值") from exc
-    if value <= 0.0:
-        raise argparse.ArgumentTypeError("必须为正数")
+    if not math.isfinite(value) or value <= 0.0:
+        raise argparse.ArgumentTypeError("必须为有限正数")
     return value
 
 
