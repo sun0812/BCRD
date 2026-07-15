@@ -12,12 +12,71 @@ assignments.
 from __future__ import annotations
 
 from typing import Dict, List, Tuple, Optional
+import hashlib
+import json
 import random
 
 from schedulers.scenario_loader import SchedulingProblem, SchedulingTask, CommWindow
 from schedulers.constraint_model import Assignment, TimePlacementStrategy
 
 from algorithms.random_utils import make_rng
+
+
+_SUPPORTED_ORDERING_VERSIONS = {"legacy_v1", "canonical_v1"}
+
+
+def _stable_order_atom(value: object) -> Tuple[str, str]:
+    """返回可比较且跨进程稳定的标量表示。"""
+    if value is None:
+        return ("none", "")
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        return (type(value).__qualname__, str(isoformat()))
+    return (type(value).__qualname__, repr(value))
+
+
+def _stable_payload_digest(value: object) -> str:
+    """哈希类 JSON 姿态数据，避免在排序键中保留大对象。"""
+    if value is None:
+        return ""
+    try:
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=repr,
+        )
+    except (TypeError, ValueError):
+        payload = repr(value)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _observation_window_order_key(window: object) -> tuple:
+    """按所有可区分观测窗口的字段生成全序键。"""
+    return (
+        _stable_order_atom(getattr(window, "start_time", None)),
+        _stable_order_atom(getattr(window, "end_time", None)),
+        _stable_order_atom(getattr(window, "satellite_id", None)),
+        _stable_order_atom(getattr(window, "mission_id", None)),
+        _stable_order_atom(getattr(window, "sensor_id", None)),
+        _stable_order_atom(getattr(window, "orbit_number", None)),
+        _stable_order_atom(getattr(window, "window_id", None)),
+        _stable_order_atom(getattr(window, "time_step", None)),
+        _stable_payload_digest(getattr(window, "agile_data", None)),
+        _stable_payload_digest(getattr(window, "non_agile_data", None)),
+    )
+
+
+def _comm_window_order_key(window: CommWindow) -> tuple:
+    """按通信窗口的全部字段生成全序键。"""
+    return (
+        _stable_order_atom(window.start_time),
+        _stable_order_atom(window.end_time),
+        _stable_order_atom(window.satellite_id),
+        _stable_order_atom(window.ground_station_id),
+        _stable_order_atom(window.window_id),
+    )
 
 
 def _estimate_data_volume_GB(problem: SchedulingProblem, w, sat_start, sat_end) -> float:
@@ -88,6 +147,7 @@ def enumerate_task_candidates(
     random_samples_per_window: int = 1,
     seed: Optional[int] = None,
     prefer_must_first: bool = True,
+    ordering_version: str = "legacy_v1",
 ) -> List[Assignment]:
     """
     Generate candidate Assignments for a single task.
@@ -95,13 +155,28 @@ def enumerate_task_candidates(
 
     This version provides diversified candidates:
     earliest, center, latest, plus several random samples.
+
+    ``legacy_v1`` 保留历史上依赖随机种子的排序方式。``canonical_v1``
+    使用完整且确定性的窗口平局判定规则；敏捷卫星先按最早、居中、最晚位置
+    排序，再按偏移量升序排列。当 ``random_samples_per_window=0`` 时，动作顺序
+    与 ``seed`` 和输入窗口顺序无关；启用随机采样后，同一种子仍可复现。
     """
+    ordering_version = str(ordering_version)
+    if ordering_version not in _SUPPORTED_ORDERING_VERSIONS:
+        supported = ", ".join(sorted(_SUPPORTED_ORDERING_VERSIONS))
+        raise ValueError(
+            f"Unsupported ordering_version={ordering_version!r}; expected one of: {supported}"
+        )
+
     if task.required_duration <= 0 or not task.windows:
         return []
 
     rng = make_rng(seed)
 
-    obs_windows = sorted(task.windows, key=lambda w: w.start_time)
+    if ordering_version == "canonical_v1":
+        obs_windows = sorted(task.windows, key=_observation_window_order_key)
+    else:
+        obs_windows = sorted(task.windows, key=lambda w: w.start_time)
     has_gs = len(problem.ground_stations) > 0
 
     comm_by_sat: Dict[str, List[CommWindow]] = {}
@@ -109,7 +184,10 @@ def enumerate_task_candidates(
         for cw in problem.comm_windows:
             comm_by_sat.setdefault(cw.satellite_id, []).append(cw)
         for sid in comm_by_sat:
-            comm_by_sat[sid].sort(key=lambda x: x.start_time)
+            if ordering_version == "canonical_v1":
+                comm_by_sat[sid].sort(key=_comm_window_order_key)
+            else:
+                comm_by_sat[sid].sort(key=lambda x: x.start_time)
 
     cands: List[Assignment] = []
     downlink_dur = task.required_duration * float(downlink_duration_ratio)
@@ -220,7 +298,9 @@ def enumerate_task_candidates(
                     must_uniq.append(k)
 
             rest = [k for k in ks if k not in must_uniq]
-            if prefer_must_first:
+            if ordering_version == "canonical_v1":
+                ks = must_uniq + rest
+            elif prefer_must_first:
                 rng.shuffle(rest)
                 ks = must_uniq + rest
             else:
