@@ -751,12 +751,9 @@ def _incomplete_signal_summary(
     for row in failed_rows:
         failure_kind = str(row["failure_kind"])
         failure_counts[failure_kind] = failure_counts.get(failure_kind, 0) + 1
-    # 资源/进程失败即使耗尽尝试仍只表示标签缺失；只有身份或哈希漂移
-    # 才作废科学执行。两类都禁止提前计算 signal gate。
-    invalid = any(
-        str(row["failure_kind"]) in _INVALID_FAILURE_KINDS
-        for row in failed_rows
-    )
+    # failed 行只在冻结的两次尝试耗尽后写入；一旦出现，本次执行即作废。
+    # 中间尝试只进入 worker journal，不得混进科学结果行。
+    invalid = bool(failed_rows)
     completed_states = sum(
         all(str(row["query_key"]) in successful_keys for row in state_queries)
         for state_queries in plan.queries_by_state.values()
@@ -839,9 +836,9 @@ def summarize_signal_gate(
 ) -> Dict[str, Any]:
     """用 Type-7 P90-P10 汇总预注册 signal gate。
 
-    只有 100 个状态和 1570 个查询全部成功时才给出 pass/fail。尚未执行或
-    资源失败的缺失查询返回 ``incomplete``；身份/哈希漂移返回 ``invalid``。
-    两者的 signal 均为 ``not_evaluated``，身份冲突则直接抛错。
+    只有 100 个状态和 1570 个查询全部成功时才给出 pass/fail。尚未执行的
+    缺失查询返回 ``incomplete``；两次尝试耗尽后物化的 ``failed`` 行返回
+    ``invalid``。两者的 signal 均为 ``not_evaluated``，身份冲突则直接抛错。
     """
     result_rows = list(query_results)
     execution_id, indexed = _index_query_results(
