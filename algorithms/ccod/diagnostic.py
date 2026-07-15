@@ -8,6 +8,7 @@ from copy import deepcopy
 import math
 from pathlib import PurePosixPath
 import re
+import sys
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 from algorithms.ccod.instances import RECOMMENDED_SPLIT
@@ -137,6 +138,7 @@ def validate_diagnostic_config(config: Mapping[str, Any]) -> None:
         (
             "schema_version",
             "seed",
+            "runtime",
             "split",
             "sources",
             "source_inventory",
@@ -153,6 +155,12 @@ def validate_diagnostic_config(config: Mapping[str, Any]) -> None:
     seed = config.get("seed")
     if isinstance(seed, bool) or not isinstance(seed, int) or seed != 20260715:
         raise DiagnosticConfigError("diagnostic_v1 seed 必须冻结为 20260715")
+    runtime = config.get("runtime")
+    if not isinstance(runtime, Mapping) or dict(runtime) != {
+        "python_implementation": "cpython",
+        "python_version": "3.10.20",
+    }:
+        raise DiagnosticConfigError("diagnostic_v1 runtime 必须冻结为 CPython 3.10.20")
     split = config.get("split")
     sources = config.get("sources")
     replay = config.get("replay")
@@ -436,6 +444,28 @@ def validate_diagnostic_config(config: Mapping[str, Any]) -> None:
         ],
     }:
         raise DiagnosticConfigError("3090 gate 必须保持关闭")
+
+
+def _current_python_runtime() -> Dict[str, str]:
+    """返回会进入诊断科学身份的解释器实现与精确版本。"""
+    return {
+        "python_implementation": sys.implementation.name,
+        "python_version": ".".join(
+            str(part) for part in sys.version_info[:3]
+        ),
+    }
+
+
+def validate_diagnostic_runtime(config: Mapping[str, Any]) -> None:
+    """在读取场景、schedule 或恢复状态前拒绝错误解释器。"""
+    validate_diagnostic_config(config)
+    expected = dict(config["runtime"])
+    actual = _current_python_runtime()
+    if actual != expected:
+        raise DiagnosticConfigError(
+            "diagnostic_v1 解释器不匹配: "
+            f"expected={expected}, actual={actual}"
+        )
 
 
 def _canonical_source_rank(

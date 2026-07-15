@@ -18,6 +18,7 @@ from algorithms.ccod.diagnostic import (
     select_preregistered_states,
     selection_summary,
     validate_diagnostic_config,
+    validate_diagnostic_runtime,
 )
 from schedulers.state_replay import (
     ACTION_KEY_VERSION,
@@ -141,8 +142,25 @@ class CCODDiagnosticTest(unittest.TestCase):
         with CONFIG_PATH.open("r", encoding="utf-8") as handle:
             config = json.load(handle)
         validate_diagnostic_config(config)
+        validate_diagnostic_runtime(config)
         self.assertEqual(config["split"]["dev"], ["cities_08", "cities_04"])
         self.assertEqual(config["state_selection"]["deduplicate_by"], "state_hash")
+
+    def test_runtime_gate_rejects_non_frozen_interpreter(self) -> None:
+        """错误 Python 必须在读取诊断来源前被明确拒绝。"""
+        config = self._config()
+        with patch(
+            "algorithms.ccod.diagnostic._current_python_runtime",
+            return_value={
+                "python_implementation": "cpython",
+                "python_version": "3.14.6",
+            },
+        ):
+            with self.assertRaisesRegex(
+                DiagnosticConfigError,
+                "解释器不匹配",
+            ):
+                validate_diagnostic_runtime(config)
 
     def test_balanced_objective_mapping_is_strict(self) -> None:
         self.assertEqual(

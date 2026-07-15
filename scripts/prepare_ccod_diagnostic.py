@@ -38,7 +38,7 @@ from algorithms.ccod.diagnostic import (
     objective_name_from_weights,
     select_preregistered_states,
     selection_summary,
-    validate_diagnostic_config,
+    validate_diagnostic_runtime,
 )
 from algorithms.ccod.instances import (
     build_recommended_split_manifest,
@@ -574,7 +574,7 @@ def verify_frozen_artifacts(
         else REPO_ROOT / "algorithms/ccod/configs/diagnostic_v1.json"
     )
     config = _load_json(config_path)
-    validate_diagnostic_config(config)
+    validate_diagnostic_runtime(config)
     config_hash = sha256_json(config)
     inventory_path = _strict_repo_file(
         config["source_inventory"]["path"],
@@ -1503,7 +1503,7 @@ def prepare_diagnostic(
     # 只采一次并传给六个来源，保证 trace provenance 在整次运行内一致。
     replay_code_provenance = collect_code_provenance()
     config = _load_json(config_path)
-    validate_diagnostic_config(config)
+    validate_diagnostic_runtime(config)
     inventory_path = REPO_ROOT / config["source_inventory"]["path"]
     inventory, split_manifest = _validate_source_inventory(
         config,
