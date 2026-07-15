@@ -12,8 +12,12 @@ import json
 import math
 from pathlib import Path
 import re
+import sys
+from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
+from algorithms.ccod.cache import validate_counterfactual_result_manifest
+from algorithms.ccod.continuation import CounterfactualError
 from algorithms.ccod.metrics import summarize_state_q_values
 from schedulers.state_replay import sha256_json
 
@@ -44,6 +48,26 @@ _FROZEN_GUARDS = {
     "state_timeout_s": 1200.0,
     "worker_peak_rss_limit_mib": 6144.0,
 }
+_RECOVERABLE_FAILURE_KINDS = frozenset(
+    {
+        "query_timeout",
+        "state_timeout",
+        "rss_exceeded",
+        "worker_exit",
+        "worker_error",
+        "attempt_exhausted",
+        "interrupted",
+    }
+)
+_INVALID_FAILURE_KINDS = frozenset(
+    {
+        "identity_mismatch",
+        "cache_corrupt",
+        "hash_mismatch",
+        "frozen_drift",
+        "runner_drift",
+    }
+)
 
 
 class CCODExecutionError(ValueError):
@@ -52,6 +76,29 @@ class CCODExecutionError(ValueError):
 
 class ExecutionIdentityError(CCODExecutionError):
     """执行身份与冻结计划或标签记录冲突时抛出的异常。"""
+
+
+def _freeze_json(value: Any) -> Any:
+    """递归冻结 JSON 树，防止旧 execution identity 下的嵌套改写。"""
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def mutable_json_copy(value: Any) -> Any:
+    """将冻结 JSON 树复制为传给 cache/oracle 的普通 dict/list。"""
+    if isinstance(value, Mapping):
+        return {
+            str(key): mutable_json_copy(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [mutable_json_copy(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True)
@@ -64,21 +111,60 @@ class FrozenDiagnosticPlan:
     query_header: Mapping[str, Any]
     query_rows: Tuple[Mapping[str, Any], ...]
     queries_by_state: Mapping[int, Tuple[Mapping[str, Any], ...]]
+    _frozen_run_id: str
+    _frozen_query_plan_hash: str
+    _frozen_selection_hash: str
+    _integrity_hash: str
+
+    def assert_pristine(self) -> None:
+        """拒绝加载后对嵌套字典的修改，防止同一身份下语义漂移。"""
+        current = sha256_json(
+            {
+                "run_manifest": mutable_json_copy(self.run_manifest),
+                "selected_states": mutable_json_copy(self.selected_states),
+                "query_header": mutable_json_copy(self.query_header),
+                "query_rows": mutable_json_copy(self.query_rows),
+            }
+        )
+        if current != self._integrity_hash:
+            raise ExecutionIdentityError("冻结诊断计划在加载后被修改")
 
     @property
     def run_id(self) -> str:
         """返回冻结 run 的内容身份。"""
-        return str(self.run_manifest["run_id"])
+        return self._frozen_run_id
 
     @property
     def query_plan_hash(self) -> str:
         """返回有序查询计划的科学哈希。"""
-        return str(self.run_manifest["query_plan_hash"])
+        return self._frozen_query_plan_hash
 
     @property
     def selection_hash(self) -> str:
         """返回 100-state 选择的科学哈希。"""
-        return str(self.run_manifest["selection_hash"])
+        return self._frozen_selection_hash
+
+
+def _current_runtime() -> Dict[str, str]:
+    """返回不可伪装预发布版本的当前 Python 精确身份。"""
+    version = ".".join(str(part) for part in sys.version_info[:3])
+    if sys.version_info.releaselevel != "final":
+        version += f"{sys.version_info.releaselevel}{sys.version_info.serial}"
+    return {
+        "python_implementation": sys.implementation.name,
+        "python_version": version,
+    }
+
+
+def require_frozen_execution_runtime() -> None:
+    """在 verifier、来源读取和执行身份构造前锁定 CPython 3.10.20。"""
+    actual = _current_runtime()
+    if actual != _FROZEN_RUNTIME:
+        raise ExecutionIdentityError(
+            "CCOD execution 解释器不匹配: "
+            f"expected={_FROZEN_RUNTIME}, actual={actual}; "
+            "请使用仓库 .venv/bin/python"
+        )
 
 
 def _strict_int(value: Any, field_name: str) -> int:
@@ -201,6 +287,22 @@ def load_frozen_diagnostic_plan(frozen_dir: str | Path) -> FrozenDiagnosticPlan:
         != "eosbench-ccod-diagnostic-run-v1"
     ):
         raise CCODExecutionError("run manifest schema_version 不受支持")
+    if run_manifest.get("status") != "planned":
+        raise CCODExecutionError("run manifest 必须保持 planned 状态")
+    continuation_config = run_manifest.get("continuation_config")
+    expected_continuation_config = {
+        "horizon": 5,
+        "policy_version": "objective_greedy_v1",
+        "tie_break_version": "action_key_lexicographic_v1",
+        "forced_action_counts_toward_horizon": True,
+    }
+    if continuation_config != expected_continuation_config:
+        raise CCODExecutionError("run manifest 的 H=5 continuation 配置已漂移")
+    continuation_hash = sha256_json(expected_continuation_config)
+    continuation_implementation_hash = _require_sha256(
+        run_manifest.get("continuation_implementation_hash"),
+        "run_manifest.continuation_implementation_hash",
+    )
     for field_name, expected in (
         ("planned_states", FROZEN_STATE_COUNT),
         ("restore_count", FROZEN_STATE_COUNT),
@@ -214,6 +316,12 @@ def load_frozen_diagnostic_plan(frozen_dir: str | Path) -> FrozenDiagnosticPlan:
     state_hashes: List[str] = []
     for row_index, row in enumerate(selected_rows):
         _verify_embedded_hash(row, "row_hash", label=f"selected[{row_index}]")
+        if (
+            row.get("schema_version") != "eosbench-ccod-state-catalog-v1"
+            or row.get("record_type") != "state"
+            or row.get("split") != "dev"
+        ):
+            raise CCODExecutionError("selected state schema/record_type/split 不合法")
         selection = row.get("selection")
         if not isinstance(selection, Mapping):
             raise CCODExecutionError("selected state 缺少 selection object")
@@ -234,10 +342,18 @@ def load_frozen_diagnostic_plan(frozen_dir: str | Path) -> FrozenDiagnosticPlan:
             )
         if not isinstance(row.get("instance_alias"), str):
             raise CCODExecutionError("selected state 缺少 instance_alias")
+        for field_name in ("constraint_hash", "enumerator_hash", "objective_hash"):
+            _require_sha256(row.get(field_name), f"selected.{field_name}")
     if selected_ordinals != list(range(FROZEN_STATE_COUNT)):
         raise CCODExecutionError("selected_ordinal 不唯一连续或文件顺序漂移")
     if len(set(state_hashes)) != FROZEN_STATE_COUNT:
         raise CCODExecutionError("selected_states 含重复 state_hash")
+    alias_counts = {
+        alias: sum(row.get("instance_alias") == alias for row in selected_rows)
+        for alias in ("cities_08", "cities_04")
+    }
+    if alias_counts != {"cities_08": 50, "cities_04": 50}:
+        raise CCODExecutionError("selected_states 必须保持两个 dev instance 各 50 个")
     if sha256_json(selected_rows) != selection_hash:
         raise CCODExecutionError("selection_hash 与 selected_states 不一致")
 
@@ -245,6 +361,8 @@ def load_frozen_diagnostic_plan(frozen_dir: str | Path) -> FrozenDiagnosticPlan:
     _verify_embedded_hash(query_header, "header_hash", label="query header")
     if query_header.get("record_type") != "header":
         raise CCODExecutionError("query_plan 首行必须是 header")
+    if query_header.get("schema_version") != "eosbench-ccod-query-plan-header-v1":
+        raise CCODExecutionError("query header schema_version 不受支持")
     for field_name, expected in (
         ("run_id", run_id),
         ("query_plan_hash", query_plan_hash),
@@ -261,6 +379,8 @@ def load_frozen_diagnostic_plan(frozen_dir: str | Path) -> FrozenDiagnosticPlan:
     query_ordinals: List[int] = []
     for row_index, row in enumerate(query_rows):
         _verify_embedded_hash(row, "row_hash", label=f"query[{row_index}]")
+        if row.get("schema_version") != "eosbench-ccod-query-plan-v1":
+            raise CCODExecutionError("query row schema_version 不受支持")
         query_ordinal = _strict_int(row.get("query_ordinal"), "query_ordinal")
         query_ordinals.append(query_ordinal)
         if row.get("run_id") != run_id:
@@ -279,6 +399,47 @@ def load_frozen_diagnostic_plan(frozen_dir: str | Path) -> FrozenDiagnosticPlan:
             raise CCODExecutionError("query row 缺少 query_identity object")
         if identity.get("state_hash") != state.get("state_hash"):
             raise CCODExecutionError("query_identity 的 state_hash 引用不一致")
+        action_key = row.get("action_key")
+        if not isinstance(action_key, Mapping):
+            raise CCODExecutionError("query row 缺少 action_key object")
+        if row.get("action_key_hash") != sha256_json(dict(action_key)):
+            raise CCODExecutionError("action_key_hash 与 action_key 不一致")
+        expected_identity_fields = {
+            "schema_version",
+            "state_hash",
+            "action_key",
+            "constraint_hash",
+            "enumerator_hash",
+            "objective_hash",
+            "horizon",
+            "continuation_hash",
+            "continuation_implementation_hash",
+        }
+        if set(identity) != expected_identity_fields:
+            raise CCODExecutionError("query_identity 字段集合已漂移")
+        if (
+            identity.get("schema_version") != "eosbench-ccod-query-v1"
+            or identity.get("action_key") != action_key
+            or identity.get("constraint_hash") != state.get("constraint_hash")
+            or identity.get("enumerator_hash") != state.get("enumerator_hash")
+            or identity.get("objective_hash") != state.get("objective_hash")
+            or identity.get("horizon") != 5
+            or identity.get("continuation_hash") != continuation_hash
+            or identity.get("continuation_implementation_hash")
+            != continuation_implementation_hash
+        ):
+            raise CCODExecutionError("query_identity 与 state/run/action 引用不一致")
+        roles = row.get("roles")
+        if (
+            not isinstance(roles, list)
+            or not roles
+            or any(not isinstance(role, str) or not role for role in roles)
+            or len(set(roles)) != len(roles)
+            or not set(roles).issubset(
+                {"observed", "skip", "stable_uniform"}
+            )
+        ):
+            raise CCODExecutionError("query row 的 roles 不在冻结唯一集合中")
         query_key = _require_sha256(row.get("query_key"), "query_key")
         if sha256_json(dict(identity)) != query_key:
             raise CCODExecutionError("query_key 与 query_identity 不一致")
@@ -292,7 +453,6 @@ def load_frozen_diagnostic_plan(frozen_dir: str | Path) -> FrozenDiagnosticPlan:
     if sha256_json(query_rows) != query_plan_hash:
         raise CCODExecutionError("query_plan_hash 与 query rows 不一致")
 
-    frozen_grouped: Dict[int, Tuple[Mapping[str, Any], ...]] = {}
     for state_ordinal, state_queries in grouped.items():
         state = selected_rows[state_ordinal]
         action_ordinals = [
@@ -308,15 +468,35 @@ def load_frozen_diagnostic_plan(frozen_dir: str | Path) -> FrozenDiagnosticPlan:
             raise CCODExecutionError(
                 f"state[{state_ordinal}] query 数不等于 min(16, C)"
             )
-        frozen_grouped[state_ordinal] = tuple(state_queries)
-
+    integrity_hash = sha256_json(
+        {
+            "run_manifest": run_manifest,
+            "selected_states": selected_rows,
+            "query_header": query_header,
+            "query_rows": query_rows,
+        }
+    )
+    frozen_selected_rows = tuple(_freeze_json(row) for row in selected_rows)
+    frozen_query_rows = tuple(_freeze_json(row) for row in query_rows)
+    immutable_grouped = MappingProxyType(
+        {
+            state_ordinal: tuple(
+                _freeze_json(row) for row in state_queries
+            )
+            for state_ordinal, state_queries in grouped.items()
+        }
+    )
     return FrozenDiagnosticPlan(
         frozen_dir=root,
-        run_manifest=run_manifest,
-        selected_states=tuple(selected_rows),
-        query_header=query_header,
-        query_rows=tuple(query_rows),
-        queries_by_state=frozen_grouped,
+        run_manifest=_freeze_json(run_manifest),
+        selected_states=frozen_selected_rows,
+        query_header=_freeze_json(query_header),
+        query_rows=frozen_query_rows,
+        queries_by_state=immutable_grouped,
+        _frozen_run_id=run_id,
+        _frozen_query_plan_hash=query_plan_hash,
+        _frozen_selection_hash=selection_hash,
+        _integrity_hash=integrity_hash,
     )
 
 
@@ -326,6 +506,8 @@ def build_execution_identity(
     runner_implementation_hash: str,
 ) -> Dict[str, Any]:
     """构造与机器路径、运行时间和 cache hit 无关的执行身份。"""
+    require_frozen_execution_runtime()
+    plan.assert_pristine()
     implementation_hash = _require_sha256(
         runner_implementation_hash,
         "runner_implementation_hash",
@@ -370,37 +552,48 @@ def _validate_execution_identity(
     return execution_identity_hash(expected)
 
 
-def _result_q_value(row: Mapping[str, Any]) -> float:
-    """读取成功结果的 Q_H，并规范化为有限 float。"""
-    source = row.get("result")
-    payload = source if isinstance(source, Mapping) else row
+def _validated_result_q_value(
+    planned: Mapping[str, Any],
+    row: Mapping[str, Any],
+) -> Tuple[float, str]:
+    """闭合验证缓存 result 身份、派生值与哈希后返回 Q_H。"""
+    payload = row.get("result")
+    if not isinstance(payload, Mapping):
+        raise CCODExecutionError("success query 必须携带完整 cache result")
     try:
-        if "q_h_hex" in payload:
-            value = float.fromhex(str(payload["q_h_hex"]))
-        else:
-            raw = payload["q_h"]
-            if isinstance(raw, bool):
-                raise TypeError
-            value = float(raw)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise CCODExecutionError("success query 缺少合法 q_h/q_h_hex") from exc
-    if not math.isfinite(value):
-        raise CCODExecutionError("Q_H 必须是有限数值")
-    return 0.0 if value == 0.0 else value
+        normalized = validate_counterfactual_result_manifest(
+            mutable_json_copy(planned["query_identity"]),
+            mutable_json_copy(payload),
+        )
+        value = float.fromhex(str(normalized["q_h_hex"]))
+        stored_result_hash = _require_sha256(
+            normalized.get("result_hash"),
+            "result.result_hash",
+        )
+    except (CounterfactualError, KeyError, TypeError, ValueError) as exc:
+        raise ExecutionIdentityError(f"cache result 不闭合: {exc}") from exc
+    return 0.0 if value == 0.0 else value, stored_result_hash
 
 
 def _index_query_results(
     plan: FrozenDiagnosticPlan,
     identity: Mapping[str, Any],
     query_results: Iterable[Mapping[str, Any]],
-) -> Tuple[str, Dict[str, Tuple[Mapping[str, Any], float | None]]]:
+) -> Tuple[
+    str,
+    Dict[str, Tuple[Mapping[str, Any], float | None, str | None]],
+]:
     """校验运行结果对计划的引用，并按 query_key 建立唯一索引。"""
+    plan.assert_pristine()
     expected_execution_id = _validate_execution_identity(plan, identity)
     planned_by_key = {
         str(row["query_key"]): row
         for row in plan.query_rows
     }
-    indexed: Dict[str, Tuple[Mapping[str, Any], float | None]] = {}
+    indexed: Dict[
+        str,
+        Tuple[Mapping[str, Any], float | None, str | None],
+    ] = {}
     for result_index, result_row in enumerate(query_results):
         if not isinstance(result_row, Mapping):
             raise CCODExecutionError(f"query result[{result_index}] 必须是 object")
@@ -424,8 +617,26 @@ def _index_query_results(
         ):
             raise CCODExecutionError("query result 的 ordinal/state 引用不一致")
         status = result_row.get("status")
-        q_value = _result_q_value(result_row) if status == "success" else None
-        indexed[query_key] = (result_row, q_value)
+        if status == "success":
+            q_value, result_hash = _validated_result_q_value(
+                planned,
+                result_row,
+            )
+        elif status == "failed":
+            if not isinstance(result_row.get("failure_kind"), str) or not str(
+                result_row.get("failure_kind")
+            ):
+                raise CCODExecutionError("failed query 必须记录 failure_kind")
+            if "result" in result_row:
+                raise CCODExecutionError("failed query 不得携带 cache result")
+            if str(result_row["failure_kind"]) not in (
+                _RECOVERABLE_FAILURE_KINDS | _INVALID_FAILURE_KINDS
+            ):
+                raise CCODExecutionError("failed query 含未知 failure_kind")
+            q_value, result_hash = None, None
+        else:
+            raise CCODExecutionError("query result status 只允许 success/failed")
+        indexed[query_key] = (result_row, q_value, result_hash)
     return expected_execution_id, indexed
 
 
@@ -445,19 +656,22 @@ def scientific_results_hash(
         query_results,
     )
     if len(indexed) != FROZEN_QUERY_COUNT or any(
-        q_value is None for _, q_value in indexed.values()
+        q_value is None for _, q_value, _ in indexed.values()
     ):
         raise CCODExecutionError("scientific hash 只接受完整成功的 1570 个查询")
     labels = []
     for planned in plan.query_rows:
         query_key = str(planned["query_key"])
         q_value = indexed[query_key][1]
+        result_hash = indexed[query_key][2]
         assert q_value is not None
+        assert result_hash is not None
         labels.append(
             {
                 "query_ordinal": planned["query_ordinal"],
                 "query_key": query_key,
                 "state_hash": planned["state_hash"],
+                "result_hash": result_hash,
                 "q_h_hex": q_value.hex(),
             }
         )
@@ -473,12 +687,30 @@ def scientific_results_hash(
 def _incomplete_signal_summary(
     plan: FrozenDiagnosticPlan,
     execution_id: str,
-    indexed: Mapping[str, Tuple[Mapping[str, Any], float | None]],
+    indexed: Mapping[
+        str,
+        Tuple[Mapping[str, Any], float | None, str | None],
+    ],
 ) -> Dict[str, Any]:
-    """构造不泄漏半成品 gate 结论的统一 incomplete 结果。"""
+    """区分可恢复缺失与终态失败，二者都不泄漏半成品 gate。"""
     successful_keys = {
-        key for key, (_, q_value) in indexed.items() if q_value is not None
+        key
+        for key, (_, q_value, _) in indexed.items()
+        if q_value is not None
     }
+    failed_rows = [
+        row
+        for row, q_value, _ in indexed.values()
+        if q_value is None and row.get("status") == "failed"
+    ]
+    failure_counts: Dict[str, int] = {}
+    for row in failed_rows:
+        failure_kind = str(row["failure_kind"])
+        failure_counts[failure_kind] = failure_counts.get(failure_kind, 0) + 1
+    invalid = any(
+        str(row["failure_kind"]) in _INVALID_FAILURE_KINDS
+        for row in failed_rows
+    )
     completed_states = sum(
         all(str(row["query_key"]) in successful_keys for row in state_queries)
         for state_queries in plan.queries_by_state.values()
@@ -486,16 +718,18 @@ def _incomplete_signal_summary(
     return {
         "schema_version": SIGNAL_GATE_SUMMARY_SCHEMA_VERSION,
         "execution_id": execution_id,
-        "execution_status": "incomplete",
+        "execution_status": "invalid" if invalid else "incomplete",
         "signal_gate": "not_evaluated",
         "method_decision": None,
-        "status": "incomplete",
+        "status": "invalid" if invalid else "incomplete",
         "decision": "not_evaluated",
         "passed": None,
         "required_states": FROZEN_STATE_COUNT,
         "completed_states": completed_states,
         "required_queries": FROZEN_QUERY_COUNT,
         "completed_queries": len(successful_keys),
+        "failed_queries": len(failed_rows),
+        "failure_counts": failure_counts,
         "scientific_results_hash": None,
         "overall": {
             "eligible_states": None,
@@ -569,7 +803,7 @@ def summarize_signal_gate(
         result_rows,
     )
     if len(indexed) != FROZEN_QUERY_COUNT or any(
-        q_value is None for _, q_value in indexed.values()
+        q_value is None for _, q_value, _ in indexed.values()
     ):
         return _incomplete_signal_summary(plan, execution_id, indexed)
 
@@ -684,6 +918,8 @@ def summarize_signal_gate(
         "completed_states": FROZEN_STATE_COUNT,
         "required_queries": FROZEN_QUERY_COUNT,
         "completed_queries": FROZEN_QUERY_COUNT,
+        "failed_queries": 0,
+        "failure_counts": {},
         "scientific_results_hash": scientific_results_hash(
             plan,
             execution_identity,
