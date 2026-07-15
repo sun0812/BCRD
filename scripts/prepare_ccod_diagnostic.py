@@ -10,7 +10,7 @@ trajectory JSONL，也不会执行 continuation 或查看任何 Q_H 标签。
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 import json
 import os
 from pathlib import Path
@@ -58,6 +58,7 @@ from schedulers.state_replay import (
 )
 from scripts.batch_export_trajectories import parse_schedule_filename
 from scripts.build_replay_manifests import (
+    REPLAY_IMPLEMENTATION_FILES,
     build_for_paths,
     collect_code_provenance,
     objective_config_from_schedule_path,
@@ -276,6 +277,7 @@ def _verify_trace_sidecars(
     expected_files: set[Path] = set()
     trace_by_hash: Dict[str, Dict[str, Any]] = {}
     state_by_trace: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    sidecar_pairs: set[Tuple[str, str]] = set()
     frozen_code: Dict[str, Any] | None = None
     for entry in inventory:
         if not isinstance(entry, Mapping):
@@ -377,6 +379,11 @@ def _verify_trace_sidecars(
         states = _read_jsonl(states_path)
         if len(states) != entry.get("state_count"):
             raise DiagnosticPreparationError("trace state_count 与 sidecar 不一致")
+        if (
+            len(states) != len(trace.get("task_ids", []))
+            or len(states) != len(trace.get("observed_action_keys", []))
+        ):
+            raise DiagnosticPreparationError("trace 任务/observed/state 数量不一致")
         by_manifest_hash: Dict[str, Dict[str, Any]] = {}
         for state in states:
             _verify_embedded_hash(
@@ -393,6 +400,7 @@ def _verify_trace_sidecars(
             if state_manifest_hash in by_manifest_hash:
                 raise DiagnosticPreparationError("state sidecar 含重复 manifest hash")
             by_manifest_hash[state_manifest_hash] = state
+            sidecar_pairs.add((trace_hash, state_manifest_hash))
         trace_by_hash[trace_hash] = {
             "entry": dict(entry),
             "trace": trace,
@@ -409,17 +417,33 @@ def _verify_trace_sidecars(
         preparation_files, Mapping
     ):
         raise DiagnosticPreparationError("实现文件 provenance 缺失")
-    if any(
-        preparation_files.get(path) != digest
-        for path, digest in implementation_files.items()
-    ):
+    missing_replay_files = [
+        path for path in REPLAY_IMPLEMENTATION_FILES if path not in preparation_files
+    ]
+    if missing_replay_files:
+        raise DiagnosticPreparationError(
+            f"preparation 缺少 replay 实现文件: {missing_replay_files}"
+        )
+    expected_replay_files = {
+        path: preparation_files[path] for path in REPLAY_IMPLEMENTATION_FILES
+    }
+    if dict(implementation_files) != expected_replay_files:
         raise DiagnosticPreparationError("trace 与 preparation 实现哈希不一致")
 
+    catalog_alias_pairs: List[Tuple[str, str]] = []
     for catalog_row in catalog_rows:
         aliases = catalog_row.get("source_aliases")
         canonical = catalog_row.get("canonical_source")
         if not isinstance(aliases, list) or not isinstance(canonical, Mapping):
             raise DiagnosticPreparationError("catalog 来源引用结构非法")
+        catalog_alias_pairs.extend(
+            (
+                str(source.get("trace_hash")),
+                str(source.get("state_manifest_hash")),
+            )
+            for source in aliases
+            if isinstance(source, Mapping)
+        )
         for source in [canonical, *aliases]:
             if not isinstance(source, Mapping):
                 raise DiagnosticPreparationError("catalog source alias 不是 object")
@@ -463,7 +487,78 @@ def _verify_trace_sidecars(
             str(canonical["trace_hash"])
         ].get(str(canonical["state_manifest_hash"])):
             raise DiagnosticPreparationError("canonical state manifest 不一致")
+    if len(catalog_alias_pairs) != len(set(catalog_alias_pairs)):
+        raise DiagnosticPreparationError("catalog source aliases 含重复 sidecar 引用")
+    if set(catalog_alias_pairs) != sidecar_pairs:
+        raise DiagnosticPreparationError("catalog 与全部 sidecar states 不是双向完备映射")
     return expected_files
+
+
+def _verify_query_prefixes_by_replay(
+    out_dir: Path,
+    selected_by_ordinal: Mapping[int, Mapping[str, Any]],
+    grouped_queries: Mapping[int, Sequence[Mapping[str, Any]]],
+    config: Mapping[str, Any],
+) -> None:
+    """独立恢复 100 个状态并重算冻结 query prefix。"""
+    problems: Dict[str, Any] = {}
+    traces: Dict[str, Dict[str, Any]] = {}
+    for state_ordinal, state in selected_by_ordinal.items():
+        instance_alias = str(state["instance_alias"])
+        canonical_source = state["canonical_source"]
+        scenario_path = _strict_repo_file(
+            canonical_source["scenario_ref"]["relative_path"],
+            label="selected scenario_ref",
+        )
+        if instance_alias not in problems:
+            problems[instance_alias] = load_scheduling_problem_from_json(
+                scenario_path
+            )
+        trace_ref = canonical_source["trace_ref"]
+        trace_hash = str(trace_ref["trace_hash"])
+        if trace_hash not in traces:
+            trace_path = _strict_relative_file(
+                out_dir,
+                trace_ref["relative_path"],
+                label="selected trace_ref",
+            )
+            traces[trace_hash] = _load_json(trace_path)
+        problem = problems[instance_alias]
+        replayed = restore_state(
+            problem,
+            traces[trace_hash],
+            canonical_source["state_manifest"],
+            scenario_path=scenario_path,
+            verify=True,
+        )
+        action_keys = [
+            candidate_action_key(problem, replayed.task_id, action)
+            for action in replayed.candidates
+        ]
+        if len(action_keys) != int(state["candidate_count"]):
+            raise DiagnosticPreparationError("重放候选数与 selected state 不一致")
+        expected_prefix = diagnostic_query_prefix(
+            str(state["state_hash"]),
+            action_keys,
+            state["observed_action_key"],
+            budget=int(config["query"]["budget_per_state"]),
+            seed=int(config["seed"]),
+        )
+        actual_queries = list(grouped_queries[state_ordinal])
+        if len(expected_prefix) != len(actual_queries):
+            raise DiagnosticPreparationError("重算 query prefix 长度不一致")
+        for action_ordinal, (expected, actual) in enumerate(
+            zip(expected_prefix, actual_queries)
+        ):
+            if (
+                actual.get("instance_alias") != instance_alias
+                or actual.get("action_ordinal") != action_ordinal
+                or actual.get("action_key") != expected["action_key"]
+                or actual.get("roles") != expected["selection_sources"]
+            ):
+                raise DiagnosticPreparationError(
+                    "query prefix 无法由恢复后的 canonical candidates 重算"
+                )
 
 
 def verify_frozen_artifacts(
@@ -543,6 +638,9 @@ def verify_frozen_artifacts(
     ]
     if set(catalog_selected) != set(selected_hashes):
         raise DiagnosticPreparationError("catalog 与 selected_states 选择不一致")
+    expected_selected = select_preregistered_states(catalog_rows, config)
+    if selected != expected_selected:
+        raise DiagnosticPreparationError("selection 无法从完整 catalog 确定性重算")
     if catalog_manifest.get("summary") != selection_summary(selected):
         raise DiagnosticPreparationError("selection summary 无法从 selected 重算")
     prelabel_audit = catalog_manifest.get("prelabel_audit")
@@ -682,6 +780,12 @@ def verify_frozen_artifacts(
             "task_id"
         ]:
             raise DiagnosticPreparationError("SKIP query 不是当前任务的 SKIP")
+    _verify_query_prefixes_by_replay(
+        out_dir,
+        selected_by_ordinal,
+        grouped,
+        config,
+    )
 
     query_plan_hash = _scientific_hash(query_rows)
     if query_plan_hash != run_manifest.get("query_plan_hash"):
@@ -1505,16 +1609,17 @@ def prepare_and_publish(
             raise FileExistsError(f"发布前目标目录被占用: {final_dir}")
         os.rename(staging_dir, final_dir)
         published = True
-        directory_fsynced = True
-        parent_fd = os.open(final_dir.parent, os.O_RDONLY)
+        directory_fsynced = False
         try:
+            parent_fd = os.open(final_dir.parent, os.O_RDONLY)
             try:
                 os.fsync(parent_fd)
-            except OSError:
-                # 某些文件系统不支持目录 fsync；rename 已经完成原子发布。
-                directory_fsynced = False
-        finally:
-            os.close(parent_fd)
+                directory_fsynced = True
+            finally:
+                os.close(parent_fd)
+        except OSError:
+            # 某些文件系统不支持目录 open/fsync；rename 已经完成原子发布。
+            pass
         result["publication"] = {
             "atomic_rename": True,
             "parent_directory_fsynced": directory_fsynced,
@@ -1523,8 +1628,10 @@ def prepare_and_publish(
     finally:
         if not published and staging_dir is not None:
             shutil.rmtree(staging_dir, ignore_errors=True)
-        os.close(lock_fd)
-        lock_path.unlink(missing_ok=True)
+        with suppress(OSError):
+            os.close(lock_fd)
+        with suppress(OSError):
+            lock_path.unlink(missing_ok=True)
 
 
 def _parser() -> argparse.ArgumentParser:

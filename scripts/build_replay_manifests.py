@@ -70,10 +70,18 @@ def collect_code_provenance(repo_root: Path = REPO_ROOT) -> Dict[str, Any]:
         capture_output=True,
         text=True,
     )
+    missing_files = [
+        relative_path
+        for relative_path in REPLAY_IMPLEMENTATION_FILES
+        if not (repo_root / relative_path).is_file()
+    ]
+    if missing_files:
+        raise FileNotFoundError(
+            f"缺少 replay 实现文件: {missing_files}"
+        )
     implementation_files = {
         relative_path: sha256_file(repo_root / relative_path)
         for relative_path in REPLAY_IMPLEMENTATION_FILES
-        if (repo_root / relative_path).is_file()
     }
     return {
         "commit_id": commit_id,
@@ -103,6 +111,7 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
     with temporary.open("wb") as handle:
         handle.write(payload)
         handle.flush()
+        os.fsync(handle.fileno())
     temporary.replace(path)
 
 
