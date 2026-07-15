@@ -101,6 +101,28 @@ class ConstraintConfig:
     agility_profile: str = "Standard-Agility"
     non_agile_transition_s: float = 10.0
 
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("placement_mode", self.placement_mode),
+            ("agility_profile", self.agility_profile),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{field_name} must be a non-empty string")
+        numeric_fields = (
+            ("downlink_duration_ratio", self.downlink_duration_ratio, False),
+            ("non_agile_transition_s", self.non_agile_transition_s, True),
+        )
+        for field_name, value, allow_zero in numeric_fields:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{field_name} must be numeric")
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                raise ValueError(f"{field_name} must be finite")
+            if numeric < 0.0 or (numeric == 0.0 and not allow_zero):
+                qualifier = "non-negative" if allow_zero else "positive"
+                raise ValueError(f"{field_name} must be {qualifier}")
+            object.__setattr__(self, field_name, numeric)
+
     def to_payload(self) -> Dict[str, Any]:
         return {
             "placement_mode": str(self.placement_mode),
@@ -144,10 +166,23 @@ class EnumeratorConfig:
     seed: int = 0
 
     def __post_init__(self) -> None:
-        if int(self.max_candidates) <= 0:
-            raise ValueError("max_candidates must be positive")
-        if int(self.random_samples_per_window) < 0:
-            raise ValueError("random_samples_per_window must be non-negative")
+        integer_fields = (
+            ("max_candidates", self.max_candidates, 1),
+            ("random_samples_per_window", self.random_samples_per_window, 0),
+            ("seed", self.seed, None),
+        )
+        for field_name, value, minimum in integer_fields:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{field_name} must be a strict integer")
+            if minimum is not None and value < minimum:
+                qualifier = "positive" if minimum == 1 else "non-negative"
+                raise ValueError(f"{field_name} must be {qualifier}")
+        if not isinstance(self.ordering_version, str):
+            raise ValueError("ordering_version must be a string")
+        if self.ordering_version not in {"legacy_v1", "canonical_v1"}:
+            raise ValueError(
+                f"unsupported ordering_version: {self.ordering_version!r}"
+            )
 
     def to_payload(self) -> Dict[str, Any]:
         return {
@@ -160,10 +195,10 @@ class EnumeratorConfig:
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "EnumeratorConfig":
         return cls(
-            max_candidates=int(payload["max_candidates"]),
-            random_samples_per_window=int(payload["random_samples_per_window"]),
-            ordering_version=str(payload["ordering_version"]),
-            seed=int(payload["seed"]),
+            max_candidates=payload["max_candidates"],
+            random_samples_per_window=payload["random_samples_per_window"],
+            ordering_version=payload["ordering_version"],
+            seed=payload["seed"],
         )
 
     @property
@@ -195,6 +230,7 @@ class ObjectiveConfig:
             normalized_values.append(numeric)
         if math.fsum(normalized_values) <= 0.0:
             raise ValueError("at least one objective weight must be positive")
+        object.__setattr__(self, "weights", tuple(normalized_values))
 
     def normalized(self) -> "ObjectiveConfig":
         w = ObjectiveWeights(*self.weights).normalized()
@@ -238,6 +274,7 @@ class ReplayedState:
     state_manifest: Dict[str, Any]
     objective_score: float
     replay_identity: Dict[str, Any]
+    problem_runtime_fingerprint: str
     runtime_fingerprint: str
 
 
@@ -419,6 +456,102 @@ def _runtime_value(value: Any) -> Any:
     )
 
 
+def problem_runtime_payload(problem: SchedulingProblem) -> Dict[str, Any]:
+    """完整编码会影响枚举、约束或目标的场景运行时语义。
+
+    字典以列表形式保留加载顺序，因为部分历史指标仍按插入顺序累加浮点数；
+    窗口同时保留列表顺序与 ``window_id``，避免不同源文件被错误视为同一问题。
+    """
+    satellites = []
+    for satellite_id, satellite in problem.satellites.items():
+        sensors = []
+        for sensor_id, sensor in satellite.sensors.items():
+            sensors.append(
+                {
+                    "dict_key": str(sensor_id),
+                    "sensor_id": str(sensor.sensor_id),
+                    "data_rate_Mbps": _runtime_value(float(sensor.data_rate_Mbps)),
+                    "power_consumption_W": _runtime_value(
+                        float(sensor.power_consumption_W)
+                    ),
+                }
+            )
+        satellites.append(
+            {
+                "dict_key": str(satellite_id),
+                "id": str(satellite.id),
+                "maneuverability_type": str(satellite.maneuverability_type),
+                "max_data_storage_GB": _runtime_value(
+                    float(satellite.max_data_storage_GB)
+                ),
+                "max_power_W": _runtime_value(float(satellite.max_power_W)),
+                "slew_rate_deg_per_s": _runtime_value(
+                    float(satellite.slew_rate_deg_per_s)
+                ),
+                "stabilization_time_s": _runtime_value(
+                    float(satellite.stabilization_time_s)
+                ),
+                "sensors": sensors,
+            }
+        )
+
+    tasks = []
+    for task_id, task in problem.tasks.items():
+        windows = []
+        for window in task.windows:
+            windows.append(
+                {
+                    "window_id": int(window.window_id),
+                    "satellite_id": str(window.satellite_id),
+                    "mission_id": str(window.mission_id),
+                    "sensor_id": str(window.sensor_id),
+                    "orbit_number": int(window.orbit_number),
+                    "start_time": _runtime_value(window.start_time),
+                    "end_time": _runtime_value(window.end_time),
+                    "time_step": _runtime_value(float(window.time_step)),
+                    "agile_data": _runtime_value(window.agile_data),
+                    "non_agile_data": _runtime_value(window.non_agile_data),
+                }
+            )
+        tasks.append(
+            {
+                "dict_key": str(task_id),
+                "id": str(task.id),
+                "priority": _runtime_value(float(task.priority)),
+                "required_duration": _runtime_value(float(task.required_duration)),
+                "windows": windows,
+            }
+        )
+
+    return {
+        "schema_version": "eosbench-problem-runtime-v1",
+        "scenario_id": str(problem.scenario_id),
+        "start_time": _runtime_value(problem.start_time),
+        "end_time": _runtime_value(problem.end_time),
+        "satellites": satellites,
+        "ground_stations": [
+            {"dict_key": str(key), "id": str(station.id)}
+            for key, station in problem.ground_stations.items()
+        ],
+        "tasks": tasks,
+        "comm_windows": [
+            {
+                "window_id": int(window.window_id),
+                "satellite_id": str(window.satellite_id),
+                "ground_station_id": str(window.ground_station_id),
+                "start_time": _runtime_value(window.start_time),
+                "end_time": _runtime_value(window.end_time),
+            }
+            for window in problem.comm_windows
+        ],
+    }
+
+
+def problem_runtime_fingerprint(problem: SchedulingProblem) -> str:
+    """返回完整 ``SchedulingProblem`` 的内容指纹。"""
+    return sha256_json(problem_runtime_payload(problem))
+
+
 def assignment_runtime_payload(assignment: Assignment) -> Dict[str, Any]:
     """完整编码会影响约束的 Assignment 字段，包括资源量与姿态角。"""
     return {
@@ -461,6 +594,7 @@ def replayed_state_runtime_fingerprint(
     candidates: Sequence[Optional[Assignment]],
     state_manifest: Mapping[str, Any],
     replay_identity: Mapping[str, Any],
+    problem_fingerprint: str,
 ) -> str:
     """绑定回放状态的可变对象、清单与配置身份，检测调用前篡改。"""
     return sha256_json(
@@ -473,6 +607,7 @@ def replayed_state_runtime_fingerprint(
             ],
             "state_manifest": dict(state_manifest),
             "replay_identity": dict(replay_identity),
+            "problem_runtime_fingerprint": str(problem_fingerprint),
         }
     )
 
@@ -906,8 +1041,10 @@ def restore_state(
         _compare_state_manifest(actual, state)
 
     score = objective_config.build_model(problem).score(schedule)
+    problem_fingerprint = problem_runtime_fingerprint(problem)
     replay_identity = {
         "scenario_hash": scenario_digest,
+        "problem_runtime_fingerprint": problem_fingerprint,
         "task_order_hash": task_order_hash,
         "constraint_hash": constraint_config.hash,
         "enumerator_hash": enumerator_config.hash,
@@ -925,12 +1062,14 @@ def restore_state(
         state_manifest=manifest_copy,
         objective_score=float(score),
         replay_identity=deepcopy(replay_identity),
+        problem_runtime_fingerprint=problem_fingerprint,
         runtime_fingerprint=replayed_state_runtime_fingerprint(
             schedule_copy,
             task_ids[step],
             candidate_copies,
             manifest_copy,
             replay_identity,
+            problem_fingerprint,
         ),
     )
 

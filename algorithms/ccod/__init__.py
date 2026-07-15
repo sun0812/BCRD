@@ -4,8 +4,10 @@
 from algorithms.ccod.continuation import (
     CounterfactualError,
     CounterfactualResult,
+    ContinuationOracle,
     ContinuationConfig,
     GreedyChoice,
+    PreparedReplayedState,
     QUERY_IDENTITY_SCHEMA_VERSION,
     build_query_identity,
     choose_objective_greedy_action,
@@ -22,8 +24,10 @@ from algorithms.ccod.cache import (
 __all__ = [
     "CounterfactualError",
     "CounterfactualResult",
+    "ContinuationOracle",
     "ContinuationConfig",
     "GreedyChoice",
+    "PreparedReplayedState",
     "QUERY_IDENTITY_SCHEMA_VERSION",
     "build_query_identity",
     "choose_objective_greedy_action",

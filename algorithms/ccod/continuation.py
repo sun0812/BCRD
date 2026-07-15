@@ -25,10 +25,12 @@ from schedulers.state_replay import (
     MANIFEST_SCHEMA_VERSION,
     ObjectiveConfig,
     ReplayedState,
+    assignment_runtime_payload,
     candidate_action_key,
     canonical_json_bytes,
     canonical_task_ids,
     enumerate_feasible_actions,
+    problem_runtime_fingerprint,
     replayed_state_runtime_fingerprint,
     schedule_hash,
     schedule_runtime_fingerprint,
@@ -172,6 +174,7 @@ class CounterfactualResult:
     terminated_by_task_exhaustion: bool
     forced_action_key: Dict[str, Any]
     rollout_action_keys: Tuple[Dict[str, Any], ...]
+    rollout_action_keys_hash: str
     objective_score_hexes: Tuple[str, ...]
     base_score: float
     forced_score: float
@@ -184,10 +187,58 @@ class CounterfactualResult:
     constraint_hash: str
     enumerator_hash: str
     objective_hash: str
-    _problem: SchedulingProblem = field(repr=False, compare=False)
+    problem_runtime_hash: str
+    _task_ids: Tuple[str, ...] = field(repr=False, compare=False)
+    _creation_fingerprint: str = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_creation_fingerprint",
+            self._current_fingerprint(),
+        )
+
+    def _current_fingerprint(self) -> str:
+        """绑定创建时的完整结果语义，检测浅层冻结内部的后续修改。"""
+        return sha256_json(
+            {
+                "query_key": self.query_key,
+                "state_hash": self.state_hash,
+                "step": int(self.step),
+                "task_id": self.task_id,
+                "requested_horizon": int(self.requested_horizon),
+                "decisions_executed": int(self.decisions_executed),
+                "terminated_by_task_exhaustion": bool(
+                    self.terminated_by_task_exhaustion
+                ),
+                "forced_action_key": self.forced_action_key,
+                "rollout_action_keys": list(self.rollout_action_keys),
+                "objective_score_hexes": list(self.objective_score_hexes),
+                "base_score_hex": _stable_float(self.base_score).hex(),
+                "forced_score_hex": _stable_float(self.forced_score).hex(),
+                "final_score_hex": _stable_float(self.final_score).hex(),
+                "q_h_hex": _stable_float(self.q_h).hex(),
+                "final_schedule_hash": self.final_schedule_hash,
+                "final_schedule_runtime_hash": self.final_schedule_runtime_hash,
+                "current_schedule_runtime_hash": schedule_runtime_fingerprint(
+                    self.final_schedule
+                ),
+                "continuation_hash": self.continuation_hash,
+                "continuation_implementation_hash": (
+                    self.continuation_implementation_hash
+                ),
+                "constraint_hash": self.constraint_hash,
+                "enumerator_hash": self.enumerator_hash,
+                "objective_hash": self.objective_hash,
+                "problem_runtime_fingerprint": self.problem_runtime_hash,
+                "task_ids": list(self._task_ids),
+            }
+        )
 
     def to_manifest(self) -> Dict[str, Any]:
         """生成不包含可变 Schedule 对象的规范结果清单。"""
+        if self._current_fingerprint() != self._creation_fingerprint:
+            raise CounterfactualError("结果对象的 creation_fingerprint 校验失败")
         if self.decisions_executed != len(self.rollout_action_keys):
             raise CounterfactualError("decisions_executed 与动作序列长度不一致")
         if not (1 <= self.decisions_executed <= self.requested_horizon):
@@ -200,6 +251,23 @@ class CounterfactualResult:
             raise CounterfactualError("强制动作与 rollout 首动作不一致")
         if self.forced_action_key.get("task_id") != self.task_id:
             raise CounterfactualError("强制动作的 task_id 与结果任务不一致")
+        current_rollout_hash = sha256_json(list(self.rollout_action_keys))
+        if current_rollout_hash != self.rollout_action_keys_hash:
+            raise CounterfactualError("rollout_action_keys_hash 与动作序列不一致")
+
+        task_ids = self._task_ids
+        stop = min(len(task_ids), self.step + self.requested_horizon)
+        expected_tasks = task_ids[self.step:stop]
+        if self.decisions_executed != len(expected_tasks):
+            raise CounterfactualError("决策数与任务耗尽边界不一致")
+        if self.terminated_by_task_exhaustion != (stop == len(task_ids)):
+            raise CounterfactualError("任务耗尽标志与决策边界不一致")
+        rollout_tasks = tuple(
+            str(action_key.get("task_id", ""))
+            for action_key in self.rollout_action_keys
+        )
+        if rollout_tasks != expected_tasks:
+            raise CounterfactualError("rollout 动作的任务顺序不一致")
 
         base_score_hex = _stable_float(self.base_score).hex()
         forced_score_hex = _stable_float(self.forced_score).hex()
@@ -216,11 +284,6 @@ class CounterfactualResult:
         if _stable_float(self.q_h).hex() != expected_q_h.hex():
             raise CounterfactualError("q_h 与最终分数减基线分数不一致")
 
-        current_schedule_hash = schedule_hash(self._problem, self.final_schedule)
-        if current_schedule_hash != self.final_schedule_hash:
-            raise CounterfactualError(
-                "final_schedule_hash 与当前结果调度不一致"
-            )
         current_runtime_hash = schedule_runtime_fingerprint(self.final_schedule)
         if current_runtime_hash != self.final_schedule_runtime_hash:
             raise CounterfactualError(
@@ -253,6 +316,7 @@ class CounterfactualResult:
             ),
             "forced_action_key": deepcopy(self.forced_action_key),
             "rollout_action_keys": deepcopy(list(self.rollout_action_keys)),
+            "rollout_action_keys_hash": self.rollout_action_keys_hash,
             "objective_score_hexes": list(self.objective_score_hexes),
             "base_score_hex": base_score_hex,
             "forced_score_hex": forced_score_hex,
@@ -267,6 +331,7 @@ class CounterfactualResult:
             "constraint_hash": self.constraint_hash,
             "enumerator_hash": self.enumerator_hash,
             "objective_hash": self.objective_hash,
+            "problem_runtime_fingerprint": self.problem_runtime_hash,
         }
         payload["result_hash"] = sha256_json(payload)
         return payload
@@ -470,8 +535,8 @@ def _candidate_hashes(
     problem: SchedulingProblem,
     task_id: str,
     candidates: Sequence[Optional[Assignment]],
-) -> Tuple[str, str, Tuple[Dict[str, Any], ...]]:
-    """计算候选的顺序哈希、成员哈希及规范 ActionKey。"""
+) -> Tuple[str, str, str, Tuple[Dict[str, Any], ...]]:
+    """计算候选 ActionKey 哈希、运行时载荷哈希及规范键。"""
     keys = tuple(
         candidate_action_key(problem, task_id, candidate)
         for candidate in candidates
@@ -480,7 +545,13 @@ def _candidate_hashes(
     membership_hash = sha256_json(
         sorted((dict(key) for key in keys), key=canonical_json_bytes)
     )
-    return ordered_hash, membership_hash, keys
+    runtime_hash = sha256_json(
+        [
+            None if candidate is None else assignment_runtime_payload(candidate)
+            for candidate in candidates
+        ]
+    )
+    return ordered_hash, membership_hash, runtime_hash, keys
 
 
 def _validate_replayed_state(
@@ -490,11 +561,13 @@ def _validate_replayed_state(
     constraint_config: ConstraintConfig,
     enumerator_config: EnumeratorConfig,
     objective_config: ObjectiveConfig,
+    known_problem_fingerprint: Optional[str] = None,
 ) -> Tuple[
     Tuple[str, ...],
     int,
     str,
     Sequence[Optional[Assignment]],
+    str,
 ]:
     """重新验证回放对象，禁止过期状态或配置混入同一查询键。"""
     identity = state.replay_identity
@@ -506,6 +579,16 @@ def _validate_replayed_state(
     for field_name, expected in expected_hashes.items():
         if identity.get(field_name) != expected:
             raise CounterfactualError(f"重放状态的 {field_name} 与查询配置不一致")
+
+    current_problem_fingerprint = (
+        str(known_problem_fingerprint)
+        if known_problem_fingerprint is not None
+        else problem_runtime_fingerprint(problem)
+    )
+    if state.problem_runtime_fingerprint != current_problem_fingerprint:
+        raise CounterfactualError("重放对象的 problem_runtime_fingerprint 已失配")
+    if identity.get("problem_runtime_fingerprint") != current_problem_fingerprint:
+        raise CounterfactualError("重放身份与当前 SchedulingProblem 不一致")
 
     manifest = state.state_manifest
     stored_manifest_hash = manifest.get("state_manifest_hash")
@@ -542,7 +625,7 @@ def _validate_replayed_state(
     if _stable_float(state.objective_score).hex() != current_score.hex():
         raise CounterfactualError("重放对象保存的 objective_score 已失配")
 
-    state_ordered, state_membership, state_keys = _candidate_hashes(
+    state_ordered, state_membership, state_runtime, state_keys = _candidate_hashes(
         problem,
         task_id,
         state.candidates,
@@ -561,7 +644,7 @@ def _validate_replayed_state(
         constraint_config,
         enumerator_config,
     )
-    fresh_ordered, fresh_membership, fresh_keys = _candidate_hashes(
+    fresh_ordered, fresh_membership, fresh_runtime, fresh_keys = _candidate_hashes(
         problem,
         task_id,
         fresh_candidates,
@@ -569,6 +652,7 @@ def _validate_replayed_state(
     if (
         fresh_ordered != state_ordered
         or fresh_membership != state_membership
+        or fresh_runtime != state_runtime
         or fresh_keys != state_keys
     ):
         raise CounterfactualError("重新枚举的候选集合与回放状态不一致")
@@ -604,11 +688,182 @@ def _validate_replayed_state(
         state.candidates,
         state.state_manifest,
         state.replay_identity,
+        state.problem_runtime_fingerprint,
     )
     if runtime_fingerprint != state.runtime_fingerprint:
         raise CounterfactualError("重放状态的 runtime_fingerprint 校验失败")
 
-    return task_ids, step, state_hash, fresh_candidates
+    return (
+        task_ids,
+        step,
+        state_hash,
+        fresh_candidates,
+        current_problem_fingerprint,
+    )
+
+
+def _prepared_snapshot_fingerprint(
+    state: ReplayedState,
+    current_actions: Sequence[Optional[Assignment]],
+    task_ids: Sequence[str],
+    step: int,
+    state_hash: str,
+    oracle_hash: str,
+) -> str:
+    """计算批量查询快照的完整创建时指纹。"""
+    return sha256_json(
+        {
+            "oracle_hash": str(oracle_hash),
+            "task_ids": [str(task_id) for task_id in task_ids],
+            "step": int(step),
+            "state_hash": str(state_hash),
+            "state_runtime_fingerprint": replayed_state_runtime_fingerprint(
+                state.schedule,
+                state.task_id,
+                state.candidates,
+                state.state_manifest,
+                state.replay_identity,
+                state.problem_runtime_fingerprint,
+            ),
+            "current_actions": [
+                None
+                if action is None
+                else assignment_runtime_payload(action)
+                for action in current_actions
+            ],
+        }
+    )
+
+
+@dataclass(frozen=True)
+class PreparedReplayedState:
+    """由 ``ContinuationOracle`` 完整验证后生成的只读查询快照。"""
+
+    state: ReplayedState = field(repr=False, compare=False)
+    task_ids: Tuple[str, ...]
+    step: int
+    state_hash: str
+    current_actions: Tuple[Optional[Assignment], ...] = field(
+        repr=False,
+        compare=False,
+    )
+    oracle_hash: str
+    _creation_fingerprint: str = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_creation_fingerprint",
+            _prepared_snapshot_fingerprint(
+                self.state,
+                self.current_actions,
+                self.task_ids,
+                self.step,
+                self.state_hash,
+                self.oracle_hash,
+            ),
+        )
+
+    def verify(self) -> None:
+        """检测快照内部的嵌套对象是否在准备后被修改。"""
+        current = _prepared_snapshot_fingerprint(
+            self.state,
+            self.current_actions,
+            self.task_ids,
+            self.step,
+            self.state_hash,
+            self.oracle_hash,
+        )
+        if current != self._creation_fingerprint:
+            raise CounterfactualError("PreparedReplayedState 创建后被修改")
+
+
+class ContinuationOracle:
+    """为同一问题上的多状态、多动作查询复用只读语义验证。
+
+    初始化时深拷贝完整问题并计算一次问题指纹；每个回放状态只需调用一次
+    ``prepare``，之后可以对该快照查询多个动作，而不会重复枚举当前候选集。
+    """
+
+    def __init__(
+        self,
+        problem: SchedulingProblem,
+        *,
+        constraint_config: ConstraintConfig,
+        enumerator_config: EnumeratorConfig,
+        objective_config: ObjectiveConfig,
+    ) -> None:
+        self._problem = deepcopy(problem)
+        self.constraint_config = deepcopy(constraint_config)
+        self.enumerator_config = deepcopy(enumerator_config)
+        self.objective_config = deepcopy(objective_config)
+        self.problem_fingerprint = problem_runtime_fingerprint(self._problem)
+        self.oracle_hash = sha256_json(
+            {
+                "schema_version": "eosbench-ccod-oracle-v1",
+                "problem_runtime_fingerprint": self.problem_fingerprint,
+                "constraint_hash": self.constraint_config.hash,
+                "enumerator_hash": self.enumerator_config.hash,
+                "objective_hash": self.objective_config.hash,
+                "continuation_implementation_hash": (
+                    continuation_implementation_hash()
+                ),
+            }
+        )
+
+    def prepare(self, state: ReplayedState) -> PreparedReplayedState:
+        """完整验证一次状态，并冻结批量动作查询所需的防御性副本。"""
+        snapshot = deepcopy(state)
+        (
+            task_ids,
+            step,
+            state_hash,
+            current_actions,
+            problem_fingerprint,
+        ) = _validate_replayed_state(
+            self._problem,
+            snapshot,
+            constraint_config=self.constraint_config,
+            enumerator_config=self.enumerator_config,
+            objective_config=self.objective_config,
+            known_problem_fingerprint=self.problem_fingerprint,
+        )
+        if problem_fingerprint != self.problem_fingerprint:
+            raise CounterfactualError("批量 Oracle 的问题指纹不一致")
+        return PreparedReplayedState(
+            state=snapshot,
+            task_ids=tuple(task_ids),
+            step=step,
+            state_hash=state_hash,
+            current_actions=tuple(deepcopy(current_actions)),
+            oracle_hash=self.oracle_hash,
+        )
+
+    def evaluate(
+        self,
+        prepared: PreparedReplayedState,
+        forced_action: ActionLike,
+        *,
+        continuation_config: ContinuationConfig = ContinuationConfig(),
+    ) -> CounterfactualResult:
+        """在已准备快照上计算一个动作的有限视野标签。"""
+        if prepared.oracle_hash != self.oracle_hash:
+            raise CounterfactualError("PreparedReplayedState 属于另一个 Oracle")
+        prepared.verify()
+        return _evaluate_verified_state(
+            self._problem,
+            prepared.state,
+            prepared.task_ids,
+            prepared.step,
+            prepared.state_hash,
+            self.problem_fingerprint,
+            forced_action,
+            prepared.current_actions,
+            constraint_config=self.constraint_config,
+            enumerator_config=self.enumerator_config,
+            objective_config=self.objective_config,
+            continuation_config=continuation_config,
+        )
 
 
 def _evaluate_verified_state(
@@ -617,6 +872,7 @@ def _evaluate_verified_state(
     task_ids: Sequence[str],
     step: int,
     state_hash: str,
+    problem_fingerprint: str,
     forced_action: ActionLike,
     current_actions: Sequence[Optional[Assignment]],
     *,
@@ -687,6 +943,7 @@ def _evaluate_verified_state(
         terminated_by_task_exhaustion=(stop == len(task_ids)),
         forced_action_key=deepcopy(forced_key),
         rollout_action_keys=tuple(deepcopy(action_keys)),
+        rollout_action_keys_hash=sha256_json(action_keys),
         objective_score_hexes=tuple(score_hexes),
         base_score=base_score,
         forced_score=forced_score,
@@ -699,7 +956,8 @@ def _evaluate_verified_state(
         constraint_hash=constraint_config.hash,
         enumerator_hash=enumerator_config.hash,
         objective_hash=objective_config.hash,
-        _problem=problem,
+        problem_runtime_hash=str(problem_fingerprint),
+        _task_ids=tuple(str(task_id) for task_id in task_ids),
     )
 
 
@@ -714,7 +972,13 @@ def evaluate_replayed_state(
     continuation_config: ContinuationConfig = ContinuationConfig(),
 ) -> CounterfactualResult:
     """验证回放身份后计算强制动作的 $Q_H$。"""
-    task_ids, step, state_hash, current_actions = _validate_replayed_state(
+    (
+        task_ids,
+        step,
+        state_hash,
+        current_actions,
+        problem_fingerprint,
+    ) = _validate_replayed_state(
         problem,
         state,
         constraint_config=constraint_config,
@@ -727,6 +991,7 @@ def evaluate_replayed_state(
         task_ids,
         step,
         state_hash,
+        problem_fingerprint,
         forced_action,
         current_actions,
         constraint_config=constraint_config,

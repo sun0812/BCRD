@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
 from typing import Any, Dict, Mapping, Optional
 
 from algorithms.ccod.continuation import (
+    CONTINUATION_SCHEMA_VERSION,
     CounterfactualError,
     CounterfactualResult,
     ContinuationConfig,
+    QUERY_IDENTITY_SCHEMA_VERSION,
     build_query_identity,
 )
 from schedulers.state_replay import (
@@ -25,6 +28,91 @@ from schedulers.state_replay import (
 
 
 LABEL_CACHE_SCHEMA_VERSION = "eosbench-ccod-label-cache-v1"
+
+
+def _canonical_object_copy(value: Mapping[str, Any]) -> Dict[str, Any]:
+    """用规范 JSON 往返生成深层快照，消除嵌套对象的 TOCTOU。"""
+    loaded = json.loads(canonical_json_bytes(dict(value)).decode("utf-8"))
+    if not isinstance(loaded, dict):
+        raise CounterfactualError("缓存身份必须是 JSON object")
+    return loaded
+
+
+def _validate_result_identity(
+    identity: Mapping[str, Any],
+    result: Mapping[str, Any],
+    key: str,
+) -> None:
+    """闭合校验查询身份、结果清单和派生数值。"""
+    if identity.get("schema_version") != QUERY_IDENTITY_SCHEMA_VERSION:
+        raise CounterfactualError("查询身份 schema_version 不受支持")
+    if result.get("schema_version") != CONTINUATION_SCHEMA_VERSION:
+        raise CounterfactualError("结果 schema_version 不受支持")
+    if result.get("query_key") != key:
+        raise CounterfactualError("结果 query_key 与缓存身份不一致")
+
+    field_pairs = (
+        ("state_hash", "state_hash"),
+        ("forced_action_key", "action_key"),
+        ("constraint_hash", "constraint_hash"),
+        ("enumerator_hash", "enumerator_hash"),
+        ("objective_hash", "objective_hash"),
+        ("requested_horizon", "horizon"),
+        ("continuation_hash", "continuation_hash"),
+        (
+            "continuation_implementation_hash",
+            "continuation_implementation_hash",
+        ),
+    )
+    for result_field, identity_field in field_pairs:
+        if result.get(result_field) != identity.get(identity_field):
+            raise CounterfactualError(
+                f"结果 {result_field} 与缓存身份不一致"
+            )
+
+    rollout = result.get("rollout_action_keys")
+    if not isinstance(rollout, list) or not rollout:
+        raise CounterfactualError("缓存结果缺少 rollout 动作序列")
+    if rollout[0] != result.get("forced_action_key"):
+        raise CounterfactualError("缓存结果的强制动作与 rollout 首动作不一致")
+    if result.get("rollout_action_keys_hash") != sha256_json(rollout):
+        raise CounterfactualError("缓存结果的 rollout 动作哈希不一致")
+
+    decisions = result.get("decisions_executed")
+    horizon = result.get("requested_horizon")
+    if (
+        isinstance(decisions, bool)
+        or not isinstance(decisions, int)
+        or isinstance(horizon, bool)
+        or not isinstance(horizon, int)
+        or not (1 <= decisions <= horizon)
+        or len(rollout) != decisions
+    ):
+        raise CounterfactualError("缓存结果的决策数或视野非法")
+
+    score_hexes = result.get("objective_score_hexes")
+    if not isinstance(score_hexes, list) or len(score_hexes) != decisions + 1:
+        raise CounterfactualError("缓存结果的目标分数序列长度非法")
+    endpoints = (
+        (0, "base_score_hex"),
+        (1, "forced_score_hex"),
+        (-1, "final_score_hex"),
+    )
+    for index, field_name in endpoints:
+        if score_hexes[index] != result.get(field_name):
+            raise CounterfactualError(f"缓存结果的 {field_name} 与分数序列不一致")
+    try:
+        base_score = float.fromhex(str(result["base_score_hex"]))
+        final_score = float.fromhex(str(result["final_score_hex"]))
+        q_h = float.fromhex(str(result["q_h_hex"]))
+    except (KeyError, ValueError) as exc:
+        raise CounterfactualError("缓存结果包含非法浮点十六进制值") from exc
+    if not all(math.isfinite(value) for value in (base_score, final_score, q_h)):
+        raise CounterfactualError("缓存结果包含非有限目标值")
+    expected_q_h = math.fsum((final_score, -base_score))
+    expected_q_h = 0.0 if expected_q_h == 0.0 else expected_q_h
+    if q_h.hex() != expected_q_h.hex():
+        raise CounterfactualError("缓存结果的 q_h 与目标差值不一致")
 
 
 def build_cache_identity(
@@ -66,7 +154,7 @@ class CounterfactualLabelCache:
 
     def load(self, identity: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         """读取并完整验证缓存；不存在时返回 ``None``。"""
-        expected_identity = dict(identity)
+        expected_identity = _canonical_object_copy(identity)
         key = cache_key(expected_identity)
         path = self.path_for_key(key)
         if not path.is_file():
@@ -94,6 +182,7 @@ class CounterfactualLabelCache:
         }
         if result.get("result_hash") != sha256_json(result_unhashed):
             raise CounterfactualError(f"cached result hash mismatch: {path}")
+        _validate_result_identity(expected_identity, result, key)
         return result
 
     def store(
@@ -102,40 +191,10 @@ class CounterfactualLabelCache:
         result: CounterfactualResult,
     ) -> Path:
         """原子保存结果；同一身份已有不同内容时拒绝覆盖。"""
-        normalized_identity = dict(identity)
+        normalized_identity = _canonical_object_copy(identity)
         key = cache_key(normalized_identity)
         result_payload = result.to_manifest()
-        if result_payload.get("query_key") != key:
-            raise CounterfactualError(
-                "result query_key differs from cache identity"
-            )
-        if result_payload.get("state_hash") != normalized_identity.get("state_hash"):
-            raise CounterfactualError("result state_hash differs from cache identity")
-        if result_payload.get("forced_action_key") != normalized_identity.get("action_key"):
-            raise CounterfactualError("result action key differs from cache identity")
-        if result_payload.get("continuation_hash") != normalized_identity.get(
-            "continuation_hash"
-        ):
-            raise CounterfactualError("result continuation hash differs from cache identity")
-        if result_payload.get("continuation_implementation_hash") != normalized_identity.get(
-            "continuation_implementation_hash"
-        ):
-            raise CounterfactualError(
-                "result continuation implementation differs from cache identity"
-            )
-        field_pairs = (
-            ("constraint_hash", "constraint_hash"),
-            ("enumerator_hash", "enumerator_hash"),
-            ("objective_hash", "objective_hash"),
-            ("requested_horizon", "horizon"),
-        )
-        for result_field, identity_field in field_pairs:
-            if result_payload.get(result_field) != normalized_identity.get(
-                identity_field
-            ):
-                raise CounterfactualError(
-                    f"result {result_field} differs from cache identity"
-                )
+        _validate_result_identity(normalized_identity, result_payload, key)
         record: Dict[str, Any] = {
             "schema_version": LABEL_CACHE_SCHEMA_VERSION,
             "cache_key": key,
