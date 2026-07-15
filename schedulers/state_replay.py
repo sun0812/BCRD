@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -174,6 +175,27 @@ class EnumeratorConfig:
 class ObjectiveConfig:
     weights: Tuple[float, float, float, float]
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.weights, tuple) or len(self.weights) != 4:
+            raise ValueError("objective weights must be a tuple of four values")
+        normalized_values = []
+        for index, value in enumerate(self.weights):
+            if isinstance(value, bool):
+                raise ValueError(f"objective weight {index} must be numeric")
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"objective weight {index} must be numeric"
+                ) from exc
+            if not math.isfinite(numeric) or numeric < 0.0:
+                raise ValueError(
+                    f"objective weight {index} must be finite and non-negative"
+                )
+            normalized_values.append(numeric)
+        if math.fsum(normalized_values) <= 0.0:
+            raise ValueError("at least one objective weight must be positive")
+
     def normalized(self) -> "ObjectiveConfig":
         w = ObjectiveWeights(*self.weights).normalized()
         return ObjectiveConfig(
@@ -206,7 +228,7 @@ class ObjectiveConfig:
         return ObjectiveModel(problem, ObjectiveWeights(*self.normalized().weights))
 
 
-@dataclass
+@dataclass(frozen=True)
 class ReplayedState:
     """已验证部分调度状态的防御性副本。"""
 
@@ -215,6 +237,8 @@ class ReplayedState:
     candidates: Tuple[Optional[Assignment], ...]
     state_manifest: Dict[str, Any]
     objective_score: float
+    replay_identity: Dict[str, Any]
+    runtime_fingerprint: str
 
 
 def canonical_task_ids(problem: SchedulingProblem) -> Tuple[str, ...]:
@@ -371,6 +395,86 @@ def _schedule_keys(
 
 def schedule_hash(problem: SchedulingProblem, schedule: Schedule) -> str:
     return sha256_json(_schedule_keys(problem, schedule))
+
+
+def _runtime_value(value: Any) -> Any:
+    """把回放对象中的嵌套值转换为可精确哈希的 JSON 载荷。"""
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise StateReplayError(f"runtime value must be finite: {value!r}")
+        return {"__float_hex__": float(value).hex()}
+    if isinstance(value, datetime):
+        return {"__datetime__": value.isoformat(timespec="microseconds")}
+    if isinstance(value, Mapping):
+        return {
+            str(key): _runtime_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_runtime_value(item) for item in value]
+    raise StateReplayError(
+        f"unsupported runtime fingerprint value: {type(value).__name__}"
+    )
+
+
+def assignment_runtime_payload(assignment: Assignment) -> Dict[str, Any]:
+    """完整编码会影响约束的 Assignment 字段，包括资源量与姿态角。"""
+    return {
+        "task_id": str(assignment.task_id),
+        "satellite_id": str(assignment.satellite_id),
+        "sat_start_time": _runtime_value(assignment.sat_start_time),
+        "sat_end_time": _runtime_value(assignment.sat_end_time),
+        "sat_window_id": int(assignment.sat_window_id),
+        "sensor_id": str(assignment.sensor_id or ""),
+        "orbit_number": int(assignment.orbit_number or 0),
+        "data_volume_GB": _runtime_value(float(assignment.data_volume_GB)),
+        "power_cost_W": _runtime_value(float(assignment.power_cost_W)),
+        "sat_angles": _runtime_value(assignment.sat_angles),
+        "ground_station_id": assignment.ground_station_id,
+        "gs_start_time": _runtime_value(assignment.gs_start_time),
+        "gs_end_time": _runtime_value(assignment.gs_end_time),
+        "gs_window_id": (
+            int(assignment.gs_window_id)
+            if assignment.gs_window_id is not None
+            else None
+        ),
+    }
+
+
+def schedule_runtime_fingerprint(schedule: Schedule) -> str:
+    """哈希调度中所有约束相关字段；求解器 metadata 不参与身份。"""
+    return sha256_json(
+        {
+            "assignments": [
+                assignment_runtime_payload(assignment)
+                for assignment in schedule.assignments
+            ]
+        }
+    )
+
+
+def replayed_state_runtime_fingerprint(
+    schedule: Schedule,
+    task_id: str,
+    candidates: Sequence[Optional[Assignment]],
+    state_manifest: Mapping[str, Any],
+    replay_identity: Mapping[str, Any],
+) -> str:
+    """绑定回放状态的可变对象、清单与配置身份，检测调用前篡改。"""
+    return sha256_json(
+        {
+            "schedule_runtime_fingerprint": schedule_runtime_fingerprint(schedule),
+            "task_id": str(task_id),
+            "candidates": [
+                None if candidate is None else assignment_runtime_payload(candidate)
+                for candidate in candidates
+            ],
+            "state_manifest": dict(state_manifest),
+            "replay_identity": dict(replay_identity),
+        }
+    )
 
 
 def _candidate_hashes(keys: Sequence[Mapping[str, Any]]) -> Tuple[str, str]:
@@ -802,12 +906,32 @@ def restore_state(
         _compare_state_manifest(actual, state)
 
     score = objective_config.build_model(problem).score(schedule)
+    replay_identity = {
+        "scenario_hash": scenario_digest,
+        "task_order_hash": task_order_hash,
+        "constraint_hash": constraint_config.hash,
+        "enumerator_hash": enumerator_config.hash,
+        "objective_hash": objective_config.hash,
+        "trace_id": str(trace["trace_id"]),
+        "trace_hash": str(trace["trace_hash"]),
+    }
+    schedule_copy = deepcopy(schedule)
+    candidate_copies = tuple(deepcopy(candidates))
+    manifest_copy = deepcopy(actual)
     return ReplayedState(
-        schedule=deepcopy(schedule),
+        schedule=schedule_copy,
         task_id=task_ids[step],
-        candidates=tuple(deepcopy(candidates)),
-        state_manifest=actual,
+        candidates=candidate_copies,
+        state_manifest=manifest_copy,
         objective_score=float(score),
+        replay_identity=deepcopy(replay_identity),
+        runtime_fingerprint=replayed_state_runtime_fingerprint(
+            schedule_copy,
+            task_ids[step],
+            candidate_copies,
+            manifest_copy,
+            replay_identity,
+        ),
     )
 
 
