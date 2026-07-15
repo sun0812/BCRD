@@ -28,6 +28,35 @@ from schedulers.state_replay import (
 
 
 LABEL_CACHE_SCHEMA_VERSION = "eosbench-ccod-label-cache-v1"
+COUNTERFACTUAL_RESULT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "query_key",
+        "state_hash",
+        "step",
+        "task_id",
+        "requested_horizon",
+        "decisions_executed",
+        "terminated_by_task_exhaustion",
+        "forced_action_key",
+        "rollout_action_keys",
+        "rollout_action_keys_hash",
+        "objective_score_hexes",
+        "base_score_hex",
+        "forced_score_hex",
+        "final_score_hex",
+        "q_h_hex",
+        "final_schedule_hash",
+        "final_schedule_runtime_hash",
+        "continuation_hash",
+        "continuation_implementation_hash",
+        "constraint_hash",
+        "enumerator_hash",
+        "objective_hash",
+        "problem_runtime_fingerprint",
+        "result_hash",
+    }
+)
 
 
 def _canonical_object_copy(value: Mapping[str, Any]) -> Dict[str, Any]:
@@ -115,6 +144,37 @@ def _validate_result_identity(
         raise CounterfactualError("缓存结果的 q_h 与目标差值不一致")
 
 
+def validate_counterfactual_result_manifest(
+    identity: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """规范化并闭合验证一个可独立审计的反事实结果清单。
+
+    cache 读写层与执行汇总层必须复用同一校验入口，避免同一 ``result_hash``
+    在两个模块中获得不同解释。返回值是与调用方嵌套对象隔离的普通 JSON
+    快照，可安全写入缓存或结果审计文件。
+    """
+    normalized_identity = _canonical_object_copy(identity)
+    normalized_result = _canonical_object_copy(result)
+    if set(normalized_result) != COUNTERFACTUAL_RESULT_FIELDS:
+        missing = sorted(COUNTERFACTUAL_RESULT_FIELDS - set(normalized_result))
+        extra = sorted(set(normalized_result) - COUNTERFACTUAL_RESULT_FIELDS)
+        raise CounterfactualError(
+            f"结果字段集合不一致: missing={missing}, extra={extra}"
+        )
+    key = cache_key(normalized_identity)
+    stored_hash = normalized_result.get("result_hash")
+    unhashed = {
+        name: value
+        for name, value in normalized_result.items()
+        if name != "result_hash"
+    }
+    if stored_hash != sha256_json(unhashed):
+        raise CounterfactualError("结果 result_hash 不一致")
+    _validate_result_identity(normalized_identity, normalized_result, key)
+    return normalized_result
+
+
 def build_cache_identity(
     *,
     state_hash: str,
@@ -177,13 +237,13 @@ class CounterfactualLabelCache:
         result = record.get("result")
         if not isinstance(result, dict):
             raise CounterfactualError(f"cache result must be an object: {path}")
-        result_unhashed = {
-            name: value for name, value in result.items() if name != "result_hash"
-        }
-        if result.get("result_hash") != sha256_json(result_unhashed):
-            raise CounterfactualError(f"cached result hash mismatch: {path}")
-        _validate_result_identity(expected_identity, result, key)
-        return result
+        try:
+            return validate_counterfactual_result_manifest(
+                expected_identity,
+                result,
+            )
+        except CounterfactualError as exc:
+            raise CounterfactualError(f"cached result invalid {path}: {exc}") from exc
 
     def store(
         self,
@@ -193,8 +253,10 @@ class CounterfactualLabelCache:
         """原子保存结果；同一身份已有不同内容时拒绝覆盖。"""
         normalized_identity = _canonical_object_copy(identity)
         key = cache_key(normalized_identity)
-        result_payload = result.to_manifest()
-        _validate_result_identity(normalized_identity, result_payload, key)
+        result_payload = validate_counterfactual_result_manifest(
+            normalized_identity,
+            result.to_manifest(),
+        )
         record: Dict[str, Any] = {
             "schema_version": LABEL_CACHE_SCHEMA_VERSION,
             "cache_key": key,
