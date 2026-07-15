@@ -61,7 +61,7 @@
     "selector_min_candidates": 17,
     "time_bins": 4,
     "candidate_count_bins": 4,
-    "observed_skip_target_fraction": 0.30,
+    "observed_skip_target_fraction": 0.0,
     "max_cap_hits": 0,
     "deduplicate_by": "state_hash",
     "canonical_source_rank": "sha256(seed,state_hash,source_family)",
@@ -102,11 +102,15 @@
     "exhaustive_states": 20,
     "exhaustive_candidate_count_min": 17,
     "exhaustive_candidate_count_max": 128,
+    "minimum_exhaustive_states_per_instance": {
+      "cities_08": 10,
+      "cities_04": 10
+    },
     "strong_states": 10,
     "exhaustive_selection": "stable_hash_balanced_instance_v1",
     "strong_selection": "stable_hash_balanced_instance_v1",
     "strong_candidate_count_min": 17,
-    "strong_disjoint_from_exhaustive": true,
+    "strong_subset_of_exhaustive": true,
     "beam_width": 8,
     "median_spearman_threshold": 0.70
   },

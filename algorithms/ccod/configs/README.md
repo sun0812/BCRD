@@ -16,7 +16,9 @@
 
 首轮诊断只使用 balanced objective 下 SA、GA、ACO 三类 solution-induced traces。先按完整 `state_hash` 合并重复状态，再用稳定哈希选定 canonical source；禁止用多个来源中的 observed action 人为调整 SKIP 比例。
 
-最终选 100 个 actionable 状态，两个 dev 实例各 50 个。选样只允许使用来源、step、candidate count、canonical observed 是否为 SKIP 和哈希身份；禁止读取 $Q_H$、优势、模型分数或任何下游标签。时间、candidate count、observed/SKIP 与 solver 仅做边际平衡，不尝试覆盖它们的笛卡尔积。
+最终选 100 个 actionable 状态，两个 dev 实例各 50 个。选样只允许使用来源、step、candidate count、canonical observed 类型和哈希身份；禁止读取 $Q_H$、优势、模型分数或任何下游标签。预标签审计发现全部 124 个 canonical observed-SKIP 状态的候选数都为 1，因而与 actionable 条件互斥；首轮诊断将 observed-SKIP 选样目标固定为 0，但每个状态仍强制查询 SKIP。时间、candidate count 与 solver 仅做边际平衡，不尝试覆盖它们的笛卡尔积。
+
+为避免看过标签后挑选验证状态，100-state selection 还硬性保证两个 dev 实例各至少 10 个状态满足 `17 <= candidate_count <= 128`。随后以稳定哈希按实例各选 10 个 exhaustive 状态，再从这 20 个状态中按实例各选 5 个做 beam-8 近似标签；二者必须在同一状态上比较。
 
 ## 查询与门槛
 

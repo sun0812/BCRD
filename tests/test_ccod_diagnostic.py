@@ -12,6 +12,7 @@ from algorithms.ccod.diagnostic import (
     DiagnosticCatalogError,
     DiagnosticConfigError,
     annotate_catalog_selection,
+    catalog_prelabel_audit,
     merge_state_catalog,
     objective_name_from_weights,
     select_preregistered_states,
@@ -233,6 +234,15 @@ class CCODDiagnosticTest(unittest.TestCase):
         self.assertEqual(len(first), 100)
         self.assertEqual(len({row["state_hash"] for row in first}), 100)
         self.assertGreaterEqual(sum(row["signal_eligible"] for row in first), 80)
+        for instance in ("cities_08", "cities_04"):
+            self.assertGreaterEqual(
+                sum(
+                    row["instance_alias"] == instance
+                    and row["exhaustive_eligible"]
+                    for row in first
+                ),
+                10,
+            )
         self.assertEqual(
             {instance: sum(row["instance_alias"] == instance for row in first)
              for instance in ("cities_08", "cities_04")},
@@ -254,7 +264,39 @@ class CCODDiagnosticTest(unittest.TestCase):
         self.assertEqual(summary["states"], 100)
         self.assertEqual(summary["unique_state_hashes"], 100)
         self.assertGreaterEqual(summary["signal_eligible_states"], 80)
+        audit = catalog_prelabel_audit(annotated, config)
+        self.assertEqual(audit["totals"]["catalog_states"], 120)
+        self.assertEqual(
+            audit["audit_hash"],
+            sha256_json(
+                {key: value for key, value in audit.items() if key != "audit_hash"}
+            ),
+        )
         self.assertNotIn("q_h", json.dumps(annotated, sort_keys=True))
+
+    def test_selection_reports_exhaustive_inventory_shortage(self) -> None:
+        config = self._config()
+        pool = self._pool()
+        replacement_pool = []
+        for row in pool:
+            if row["instance_alias"] == "cities_04":
+                replacement_pool.append(
+                    self._source(
+                        instance="cities_04",
+                        index=int(row["step"]),
+                        family=str(row["source_family"]),
+                        observed_kind=str(row["observed_action_key"]["kind"]),
+                        candidate_count=10,
+                    )
+                )
+            else:
+                replacement_pool.append(row)
+        catalog = merge_state_catalog(replacement_pool, config)
+        with self.assertRaisesRegex(
+            DiagnosticCatalogError,
+            "cities_04 exhaustive-eligible 库存不足",
+        ):
+            select_preregistered_states(catalog, config)
 
     def test_selection_rejects_duplicate_catalog_hashes(self) -> None:
         config = self._config()

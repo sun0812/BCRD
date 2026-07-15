@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -36,9 +36,15 @@ from scripts.batch_export_trajectories import (
 REPLAY_IMPLEMENTATION_FILES = (
     "algorithms/candidate_pool.py",
     "algorithms/objectives.py",
+    "algorithms/random_utils.py",
+    "schedulers/balance_utils.py",
     "schedulers/constraint_model.py",
     "schedulers/scenario_loader.py",
     "schedulers/state_replay.py",
+    "schedulers/timeliness_utils.py",
+    "schedulers/transition_utils.py",
+    "scripts/batch_export_trajectories.py",
+    "scripts/build_replay_manifests.py",
 )
 
 
@@ -134,6 +140,7 @@ def build_for_paths(
     downlink_duration_ratio: float,
     agility_profile: str,
     non_agile_transition_s: float,
+    code_provenance: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Path, Path, Dict[str, Any], List[Dict[str, Any]]]:
     problem = load_scheduling_problem_from_json(scenario_path)
     constraint_config = ConstraintConfig(
@@ -156,7 +163,13 @@ def build_for_paths(
         constraint_config=constraint_config,
         enumerator_config=enumerator_config,
         objective_config=objective_config,
-        code_provenance=collect_code_provenance(),
+        # 批量调用方可在启动时只采一次 provenance，避免运行中无关 commit
+        # 让同一冻结包的多个 trace 混入不同 Git 身份。
+        code_provenance=(
+            dict(code_provenance)
+            if code_provenance is not None
+            else collect_code_provenance()
+        ),
     )
     trace_path, states_path = write_replay_manifests(
         out_dir,

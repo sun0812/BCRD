@@ -249,7 +249,7 @@ def validate_diagnostic_config(config: Mapping[str, Any]) -> None:
         "selector_min_candidates": 17,
         "time_bins": 4,
         "candidate_count_bins": 4,
-        "observed_skip_target_fraction": 0.30,
+        "observed_skip_target_fraction": 0.0,
         "max_cap_hits": 0,
         "deduplicate_by": "state_hash",
         "canonical_source_rank": "sha256(seed,state_hash,source_family)",
@@ -399,11 +399,15 @@ def validate_diagnostic_config(config: Mapping[str, Any]) -> None:
         "exhaustive_states": 20,
         "exhaustive_candidate_count_min": 17,
         "exhaustive_candidate_count_max": 128,
+        "minimum_exhaustive_states_per_instance": {
+            "cities_08": 10,
+            "cities_04": 10,
+        },
         "strong_states": 10,
         "exhaustive_selection": "stable_hash_balanced_instance_v1",
         "strong_selection": "stable_hash_balanced_instance_v1",
         "strong_candidate_count_min": 17,
-        "strong_disjoint_from_exhaustive": True,
+        "strong_subset_of_exhaustive": True,
         "beam_width": 8,
         "median_spearman_threshold": 0.70,
     }:
@@ -740,12 +744,15 @@ def select_preregistered_states(
     validate_diagnostic_config(config)
     selection = config["state_selection"]
     gate = config["signal_gate"]
+    validity = config["label_validity"]
     max_step = int(config["replay"]["max_step_inclusive"])
     actionable_min = int(selection["actionable_min_candidates"])
     signal_min = int(selection["signal_min_candidates"])
     time_bins = int(selection["time_bins"])
     count_bins = int(selection["candidate_count_bins"])
     seed = int(config["seed"])
+    exhaustive_min = int(validity["exhaustive_candidate_count_min"])
+    exhaustive_max = int(validity["exhaustive_candidate_count_max"])
 
     unique_hashes = {str(row["state_hash"]) for row in catalog}
     if len(unique_hashes) != len(catalog):
@@ -768,6 +775,36 @@ def select_preregistered_states(
             raise DiagnosticCatalogError(
                 f"{instance_alias} actionable 状态不足: {len(pool)} < {quota}"
             )
+        minimum_signal = int(
+            gate["minimum_signal_states_per_instance"][instance_alias]
+        )
+        available_signal = sum(
+            int(row["candidate_count"]) >= signal_min for row in pool
+        )
+        if available_signal < minimum_signal:
+            raise DiagnosticCatalogError(
+                f"{instance_alias} signal-eligible 库存不足: "
+                f"{available_signal} < {minimum_signal}"
+            )
+        minimum_exhaustive = min(
+            quota,
+            int(
+                validity["minimum_exhaustive_states_per_instance"][
+                    instance_alias
+                ]
+            ),
+        )
+        available_exhaustive = sum(
+            exhaustive_min
+            <= int(row["candidate_count"])
+            <= exhaustive_max
+            for row in pool
+        )
+        if available_exhaustive < minimum_exhaustive:
+            raise DiagnosticCatalogError(
+                f"{instance_alias} exhaustive-eligible 库存不足: "
+                f"{available_exhaustive} < {minimum_exhaustive}"
+            )
         bin_by_hash = _candidate_bins(pool, count_bins)
         for row in pool:
             row["time_bin"] = min(
@@ -780,6 +817,11 @@ def select_preregistered_states(
                 "skip" if bool(row["observed_is_skip"]) else "assign"
             )
             row["signal_eligible"] = int(row["candidate_count"]) >= signal_min
+            row["exhaustive_eligible"] = (
+                exhaustive_min
+                <= int(row["candidate_count"])
+                <= exhaustive_max
+            )
             row["selection_rank"] = _selection_rank(row, seed)
 
         source_targets = _balanced_targets(
@@ -791,11 +833,10 @@ def select_preregistered_states(
             round(quota * float(selection["observed_skip_target_fraction"]))
         )
         observed_targets = {"skip": skip_target, "assign": quota - skip_target}
-        minimum_signal = int(
-            gate["minimum_signal_states_per_instance"][instance_alias]
-        )
         maximum_non_signal = quota - minimum_signal
+        maximum_non_exhaustive = quota - minimum_exhaustive
         non_signal_selected = 0
+        non_exhaustive_selected = 0
         counts = {
             "source_family": Counter(),
             "time_bin": Counter(),
@@ -810,6 +851,11 @@ def select_preregistered_states(
                 if state_hash in chosen_hashes:
                     continue
                 if not row["signal_eligible"] and non_signal_selected >= maximum_non_signal:
+                    continue
+                if (
+                    not row["exhaustive_eligible"]
+                    and non_exhaustive_selected >= maximum_non_exhaustive
+                ):
                     continue
                 score = 0.0
                 dimensions = (
@@ -839,6 +885,8 @@ def select_preregistered_states(
             chosen_hashes.add(str(chosen["state_hash"]))
             if not chosen["signal_eligible"]:
                 non_signal_selected += 1
+            if not chosen["exhaustive_eligible"]:
+                non_exhaustive_selected += 1
             for dimension in (
                 "source_family",
                 "time_bin",
@@ -858,6 +906,23 @@ def select_preregistered_states(
     signal_count = sum(bool(row["signal_eligible"]) for row in selected)
     if signal_count < int(gate["minimum_signal_states"]):
         raise DiagnosticCatalogError("选样结果未达到 minimum_signal_states")
+    for instance_alias, minimum in validity[
+        "minimum_exhaustive_states_per_instance"
+    ].items():
+        actual = sum(
+            row["instance_alias"] == instance_alias
+            and bool(row["exhaustive_eligible"])
+            for row in selected
+        )
+        effective_minimum = min(
+            int(selection["per_instance"][instance_alias]),
+            int(minimum),
+        )
+        if actual < effective_minimum:
+            raise DiagnosticCatalogError(
+                f"{instance_alias} exhaustive-eligible 状态不足: "
+                f"{actual} < {effective_minimum}"
+            )
     selected.sort(
         key=lambda row: (
             config["split"]["dev"].index(row["instance_alias"]),
@@ -938,6 +1003,9 @@ def selection_summary(selected: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
         "signal_eligible_states": sum(
             bool(row["signal_eligible"]) for row in selected
         ),
+        "exhaustive_eligible_states": sum(
+            bool(row["exhaustive_eligible"]) for row in selected
+        ),
         "candidate_count_min": min(int(row["candidate_count"]) for row in selected),
         "candidate_count_max": max(int(row["candidate_count"]) for row in selected),
         "marginals": {
@@ -945,3 +1013,91 @@ def selection_summary(selected: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             for name, counter in dimensions.items()
         },
     }
+
+
+def catalog_prelabel_audit(
+    catalog: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """仅用标签前字段统计可行动、信号与 exhaustive 库存。"""
+    validate_diagnostic_config(config)
+    selection = config["state_selection"]
+    validity = config["label_validity"]
+    max_step = int(config["replay"]["max_step_inclusive"])
+    actionable_min = int(selection["actionable_min_candidates"])
+    signal_min = int(selection["signal_min_candidates"])
+    exhaustive_min = int(validity["exhaustive_candidate_count_min"])
+    exhaustive_max = int(validity["exhaustive_candidate_count_max"])
+
+    def summarize(rows: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
+        in_step = [row for row in rows if 0 <= int(row["step"]) <= max_step]
+        uncapped = [row for row in in_step if not bool(row.get("cap_reached"))]
+        actionable = [
+            row
+            for row in uncapped
+            if int(row["candidate_count"]) >= actionable_min
+        ]
+        return {
+            "catalog_states": len(rows),
+            "observed_skip_states": sum(
+                bool(row["observed_is_skip"]) for row in rows
+            ),
+            "within_step_states": len(in_step),
+            "cap_hit_states": sum(bool(row.get("cap_reached")) for row in rows),
+            "actionable_states": len(actionable),
+            "actionable_observed_skip_states": sum(
+                bool(row["observed_is_skip"]) for row in actionable
+            ),
+            "signal_eligible_states": sum(
+                int(row["candidate_count"]) >= signal_min
+                for row in actionable
+            ),
+            "exhaustive_eligible_states": sum(
+                exhaustive_min
+                <= int(row["candidate_count"])
+                <= exhaustive_max
+                for row in actionable
+            ),
+        }
+
+    dev_rows = [
+        row
+        for row in catalog
+        if row.get("split") == "dev"
+        and row.get("instance_alias") in config["split"]["dev"]
+    ]
+    observed_skip_rows = [
+        row for row in dev_rows if bool(row["observed_is_skip"])
+    ]
+    skip_counts = [int(row["candidate_count"]) for row in observed_skip_rows]
+    payload: Dict[str, Any] = {
+        "schema_version": "eosbench-ccod-prelabel-audit-v1",
+        "thresholds": {
+            "max_step_inclusive": max_step,
+            "actionable_min_candidates": actionable_min,
+            "signal_min_candidates": signal_min,
+            "exhaustive_candidate_count_min": exhaustive_min,
+            "exhaustive_candidate_count_max": exhaustive_max,
+        },
+        "totals": summarize(dev_rows),
+        "per_instance": {
+            instance_alias: summarize(
+                [
+                    row
+                    for row in dev_rows
+                    if row["instance_alias"] == instance_alias
+                ]
+            )
+            for instance_alias in config["split"]["dev"]
+        },
+        "observed_skip_candidate_count": {
+            "states": len(skip_counts),
+            "minimum": min(skip_counts) if skip_counts else None,
+            "maximum": max(skip_counts) if skip_counts else None,
+            "below_actionable": sum(
+                count < actionable_min for count in skip_counts
+            ),
+        },
+    }
+    payload["audit_hash"] = sha256_json(payload)
+    return payload
