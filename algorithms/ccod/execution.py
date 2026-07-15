@@ -15,7 +15,7 @@ import sys
 from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
-from algorithms.ccod.cache import validate_counterfactual_result_manifest
+from algorithms.ccod.cache import _validate_result_identity, cache_key
 from algorithms.ccod.continuation import CounterfactualError
 from algorithms.ccod.metrics import summarize_state_q_values
 from schedulers.state_replay import sha256_json
@@ -65,6 +65,35 @@ _INVALID_FAILURE_KINDS = frozenset(
         "hash_mismatch",
         "frozen_drift",
         "runner_drift",
+    }
+)
+_COUNTERFACTUAL_RESULT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "query_key",
+        "state_hash",
+        "step",
+        "task_id",
+        "requested_horizon",
+        "decisions_executed",
+        "terminated_by_task_exhaustion",
+        "forced_action_key",
+        "rollout_action_keys",
+        "rollout_action_keys_hash",
+        "objective_score_hexes",
+        "base_score_hex",
+        "forced_score_hex",
+        "final_score_hex",
+        "q_h_hex",
+        "final_schedule_hash",
+        "final_schedule_runtime_hash",
+        "continuation_hash",
+        "continuation_implementation_hash",
+        "constraint_hash",
+        "enumerator_hash",
+        "objective_hash",
+        "problem_runtime_fingerprint",
+        "result_hash",
     }
 )
 
@@ -560,9 +589,25 @@ def _validated_result_q_value(
     if not isinstance(payload, Mapping):
         raise CCODExecutionError("success query 必须携带完整 cache result")
     try:
-        normalized = validate_counterfactual_result_manifest(
-            mutable_json_copy(planned["query_identity"]),
-            mutable_json_copy(payload),
+        normalized_identity = mutable_json_copy(planned["query_identity"])
+        normalized = mutable_json_copy(payload)
+        if set(normalized) != _COUNTERFACTUAL_RESULT_FIELDS:
+            missing = sorted(_COUNTERFACTUAL_RESULT_FIELDS - set(normalized))
+            extra = sorted(set(normalized) - _COUNTERFACTUAL_RESULT_FIELDS)
+            raise CounterfactualError(
+                f"结果字段集合不一致: missing={missing}, extra={extra}"
+            )
+        unhashed = {
+            name: value
+            for name, value in normalized.items()
+            if name != "result_hash"
+        }
+        if normalized.get("result_hash") != sha256_json(unhashed):
+            raise CounterfactualError("结果 result_hash 不一致")
+        _validate_result_identity(
+            normalized_identity,
+            normalized,
+            cache_key(normalized_identity),
         )
         value = float.fromhex(str(normalized["q_h_hex"]))
         stored_result_hash = _require_sha256(
