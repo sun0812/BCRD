@@ -528,8 +528,8 @@ class SignalGateTest(unittest.TestCase):
         with self.assertRaisesRegex(ExecutionIdentityError, "冲突"):
             summarize_signal_gate(self.plan, self.identity, rows)
 
-    def test_recoverable_failures_keep_the_run_incomplete(self) -> None:
-        """资源与进程故障可恢复，不能冒充科学身份作废。"""
+    def test_exhausted_resource_failures_invalidate_the_run(self) -> None:
+        """资源故障可在中间重试，但耗尽后写入 failed 即作废本轮。"""
         recoverable = (
             "query_timeout",
             "state_timeout",
@@ -546,7 +546,7 @@ class SignalGateTest(unittest.TestCase):
                 rows[0]["status"] = "failed"
                 rows[0]["failure_kind"] = failure_kind
                 summary = summarize_signal_gate(self.plan, self.identity, rows)
-                self.assertEqual(summary["execution_status"], "incomplete")
+                self.assertEqual(summary["execution_status"], "invalid")
                 self.assertEqual(summary["signal_gate"], "not_evaluated")
                 self.assertIsNone(summary["method_decision"])
                 self.assertEqual(summary["failure_counts"], {failure_kind: 1})
@@ -660,8 +660,8 @@ class SignalGateTest(unittest.TestCase):
         with self.assertRaisesRegex(CCODExecutionError, "q_h 与目标差值"):
             summarize_signal_gate(self.plan, self.identity, [wrong_q])
 
-    def test_recoverable_failure_and_missing_are_both_incomplete(self) -> None:
-        """可恢复失败与尚未运行都不得提前计算 signal gate。"""
+    def test_terminal_failure_is_invalid_but_missing_is_incomplete(self) -> None:
+        """尚未运行可恢复；两次尝试耗尽后的 failed row 作废本轮。"""
         missing = summarize_signal_gate(self.plan, self.identity, [])
         self.assertEqual(missing["execution_status"], "incomplete")
         self.assertEqual(missing["failed_queries"], 0)
@@ -682,7 +682,7 @@ class SignalGateTest(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(failed["execution_status"], "incomplete")
+        self.assertEqual(failed["execution_status"], "invalid")
         self.assertEqual(failed["signal_gate"], "not_evaluated")
         self.assertIsNone(failed["passed"])
         self.assertEqual(failed["failed_queries"], 1)
