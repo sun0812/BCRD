@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 from contextlib import ExitStack, redirect_stderr
+import hashlib
 import io
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -17,11 +19,14 @@ from schedulers.state_replay import sha256_json
 from scripts.run_ccod_diagnostic import (
     CCODRunnerError,
     INVALID_FAILURE_KINDS,
+    MAX_CACHE_RECORD_BYTES,
     QueryDeadlineExceeded,
     RunnerAttemptError,
     _acquire_run_lock,
+    _assert_parent_lease,
     _heartbeat_journal,
     _open_label_cache,
+    _real_runtime_factory,
     _launch_state_attempt,
     _result_rows_from_cache,
     _restore_state_progress,
@@ -43,6 +48,21 @@ from scripts.run_ccod_diagnostic import (
 
 RUN_ID = "sha256:" + "12" * 32
 EXECUTION_ID = "sha256:" + "34" * 32
+
+
+def _synthetic_parent_lease() -> dict:
+    """构造仅供命令组装测试使用的完整父锁租约。"""
+    payload = {
+        "schema_version": "eosbench-ccod-parent-lease-v1",
+        "execution_id": EXECUTION_ID,
+        "parent_pid": 12345,
+        "lease_id": "ab" * 32,
+        "lock_device": 1,
+        "lock_inode": 2,
+        "acquired_unix_ns": 3,
+    }
+    payload["lease_hash"] = sha256_json(payload)
+    return payload
 
 
 def _query(ordinal: int, state_hash: str, state_ordinal: int = 0) -> dict:
@@ -267,6 +287,46 @@ class CacheFirstWorkerTest(unittest.TestCase):
                 ),
             )
 
+    def test_released_parent_lease_blocks_cache_publication(self) -> None:
+        """父锁在 evaluate 后释放时，结果不得进入权威 cache。"""
+        plan = _plan(query_count=1)
+        cache = _FakeCache()
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory).resolve()
+            lease = _acquire_run_lock(run, EXECUTION_ID)
+
+            def assert_live() -> None:
+                _assert_parent_lease(
+                    run,
+                    EXECUTION_ID,
+                    lease.payload,
+                    require_direct_parent=False,
+                )
+
+            # 先证明同一租约在锁仍存活时可以通过。
+            assert_live()
+
+            class LeaseDroppingOracle:
+                def evaluate(self, _prepared, _action_key, *, continuation_config):
+                    del _prepared, _action_key, continuation_config
+                    lease.close()
+                    return _FakeResult(plan.query_rows[0]["query_key"])
+
+            with self.assertRaisesRegex(RunnerAttemptError, "释放运行锁"):
+                execute_state_worker(
+                    plan,
+                    0,
+                    cache,
+                    lambda _event, _details: None,
+                    query_timeout_s=0.5,
+                    runtime_factory=lambda _plan, _ordinal: (
+                        LeaseDroppingOracle(),
+                        object(),
+                    ),
+                    authorization_check=assert_live,
+                )
+        self.assertEqual(cache.values, {})
+
 
 class CheckpointTest(unittest.TestCase):
     """验证父进程只有在全 state cache 完整时才发布 checkpoint。"""
@@ -397,6 +457,28 @@ class GuardTest(unittest.TestCase):
             }
         self.assertEqual(after, before)
 
+    def test_cache_load_rejects_fifo_and_oversized_record(self) -> None:
+        """不可信 record 不能用 FIFO 阻塞父进程，也不能无界占用内存。"""
+        from algorithms.ccod.continuation import CounterfactualError
+
+        identity = _query(0, "sha256:" + "56" * 32)["query_identity"]
+        key = sha256_json(identity).removeprefix("sha256:")
+        shard, filename = key[:2], f"{key}.json"
+        with tempfile.TemporaryDirectory() as directory:
+            cache_root = Path(directory).resolve() / "cache"
+            shard_dir = cache_root / shard
+            shard_dir.mkdir(parents=True)
+            record = shard_dir / filename
+            os.mkfifo(record)
+            cache = _open_label_cache(cache_root)
+            with self.assertRaisesRegex(CounterfactualError, "普通文件"):
+                cache.load(identity)
+            record.unlink()
+            with record.open("wb") as handle:
+                handle.truncate(MAX_CACHE_RECORD_BYTES + 1)
+            with self.assertRaisesRegex(CounterfactualError, "普通文件"):
+                cache.load(identity)
+
     def test_secure_cache_roundtrip_uses_frozen_record_schema(self) -> None:
         """安全 cache 仍须兼容冻结记录格式并能完成原子读写。"""
         identity = _query(0, "sha256:" + "56" * 32)["query_identity"]
@@ -436,6 +518,17 @@ class GuardTest(unittest.TestCase):
             ), self.assertRaises((CCODRunnerError, CounterfactualError)):
                 cache.store(identity, result)
             self.assertEqual(list(outside.iterdir()), [])
+
+    def test_cache_factory_rejects_preexisting_root_symlink(self) -> None:
+        """直接调用 cache 工厂也不能让 resolve 吞掉已有根链接。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            outside = root / "outside"
+            alias = root / "cache-alias"
+            outside.mkdir()
+            alias.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(CCODRunnerError, "根目录不允许符号链接"):
+                _open_label_cache(alias)
 
     def test_input_symlink_is_rejected_before_resolve(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -480,6 +573,8 @@ class GuardTest(unittest.TestCase):
             execution_id=EXECUTION_ID,
             runner_hash="sha256:" + "90" * 32,
             invocation=1,
+            parent_pid=12345,
+            parent_lease_id="ab" * 32,
         )
         self.assertEqual(command[0], sys.executable)
         parsed = build_parser().parse_args(command[2:])
@@ -488,6 +583,8 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(parsed.state_ordinal, 0)
         self.assertEqual(parsed.attempt, 1)
         self.assertEqual(parsed.query_timeout_s, 120.0)
+        self.assertEqual(parsed.parent_pid, 12345)
+        self.assertEqual(parsed.parent_lease_id, "ab" * 32)
 
     def test_parser_rejects_nonfinite_query_timeout(self) -> None:
         """内部 deadline 参数也不得接受 NaN/Inf。"""
@@ -505,6 +602,16 @@ class GuardTest(unittest.TestCase):
                             raw,
                         ]
                     )
+
+    def test_runtime_replay_identity_error_is_not_recoverable(self) -> None:
+        """冻结 state/trace 缺损不得被降级成可重试 worker_error。"""
+        plan = SimpleNamespace(
+            selected_states=({},),
+            frozen_dir=Path("/tmp/synthetic-frozen"),
+        )
+        with self.assertRaises(RunnerAttemptError) as raised:
+            _real_runtime_factory(plan, 0)
+        self.assertEqual(raised.exception.failure_kind, "identity_mismatch")
 
     def test_worker_final_report_requires_bounded_finite_rss(self) -> None:
         base = {
@@ -621,6 +728,83 @@ class GuardTest(unittest.TestCase):
                 returncode = _worker_main(args)
             self.assertEqual(returncode, 1)
             self.assertFalse((run / "workers").exists())
+
+    def test_hidden_worker_requires_a_live_parent_lock(self) -> None:
+        """遗留的 running manifest 与租约字节不能替代仍被持有的 flock。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            frozen = root / "frozen"
+            run = root / "run"
+            cache = run / "cache"
+            frozen.mkdir()
+            run.mkdir()
+            probe = _acquire_run_lock(run, EXECUTION_ID)
+            probe.close()
+            lock_stat = (run / ".runner.lock").stat()
+            lease = {
+                "schema_version": "eosbench-ccod-parent-lease-v1",
+                "execution_id": EXECUTION_ID,
+                "parent_pid": os.getppid(),
+                "lease_id": "cd" * 32,
+                "lock_device": int(lock_stat.st_dev),
+                "lock_inode": int(lock_stat.st_ino),
+                "acquired_unix_ns": 1,
+            }
+            lease["lease_hash"] = sha256_json(lease)
+            (run / ".runner.lock").write_text(
+                json.dumps(lease, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            parent_manifest = {
+                "schema_version": "eosbench-ccod-runner-v1",
+                "execution_id": EXECUTION_ID,
+                "execution_identity": {
+                    "runner_implementation_hash": "sha256:" + "90" * 32,
+                },
+                "frozen_snapshot_hash": "sha256:" + "ab" * 32,
+                "paths": {
+                    "frozen_dir": str(frozen),
+                    "run_dir": str(run),
+                    "cache_dir": str(cache),
+                },
+                "parent_lease": lease,
+                "invocation": 1,
+                "state_ordinals_this_invocation": [0],
+                "state_progress": {
+                    "0": {
+                        "attempts_started": 1,
+                        "active_attempt": 1,
+                        "active_started_unix_ns": 1,
+                    }
+                },
+                "status": "running",
+            }
+            parent_manifest["manifest_hash"] = sha256_json(parent_manifest)
+            (run / "execution_manifest.json").write_text(
+                json.dumps(parent_manifest, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                frozen_dir=frozen,
+                run_dir=run,
+                cache_dir=cache,
+                state_ordinal=0,
+                attempt=1,
+                query_timeout_s=120.0,
+                execution_id=EXECUTION_ID,
+                invocation=1,
+                runner_hash="sha256:" + "90" * 32,
+                frozen_snapshot_hash="sha256:" + "ab" * 32,
+                parent_pid=lease["parent_pid"],
+                parent_lease_id=lease["lease_id"],
+            )
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                returncode = _worker_main(args)
+            self.assertEqual(returncode, 1)
+            self.assertIn("释放运行锁", stderr.getvalue())
+            self.assertFalse((run / "workers").exists())
+            self.assertFalse(cache.exists())
 
     def test_hidden_worker_binds_timeout_state_attempt_and_paths(self) -> None:
         """手工 worker 不得绕过冻结 deadline 或父进程授权坐标。"""
@@ -767,10 +951,75 @@ class GuardTest(unittest.TestCase):
                         execution_id=EXECUTION_ID,
                         runner_hash="sha256:" + "90" * 32,
                         frozen_snapshot_hash="sha256:" + "ab" * 32,
+                        parent_lease=_synthetic_parent_lease(),
+                        expected_query_keys=("sha256:" + "11" * 32,),
                     )
         process.terminate.assert_called_once_with()
         process.wait.assert_called()
         process.communicate.assert_called_with(timeout=2.0)
+
+    def test_nonzero_exit_cannot_be_hidden_by_success_report(self) -> None:
+        """进程异常退出时，即使 report 自哈希正确也不能判为成功。"""
+        process = mock.Mock()
+        process.pid = 12345
+        lease = _synthetic_parent_lease()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            run = root / "run"
+            run.mkdir()
+            report_path = _worker_report_path(run, 1, 0, 1)
+
+            def finish_worker(_process, **_kwargs):
+                payload = {
+                    "schema_version": "eosbench-ccod-worker-report-v1",
+                    "execution_id": EXECUTION_ID,
+                    "runner_implementation_hash": "sha256:" + "90" * 32,
+                    "frozen_snapshot_hash": "sha256:" + "ab" * 32,
+                    "invocation": 1,
+                    "state_ordinal": 0,
+                    "attempt": 1,
+                    "status": "success",
+                    "restored": False,
+                    "planned_queries": 1,
+                    "cache_hits": 1,
+                    "evaluated_queries": 0,
+                    "fresh_query_keys": [],
+                    "peak_rss_mib": 32.0,
+                }
+                payload["report_hash"] = sha256_json(payload)
+                report_path.parent.mkdir(parents=True)
+                report_path.write_text(
+                    json.dumps(payload, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(
+                    violation=None,
+                    returncode=7,
+                    stderr="",
+                )
+
+            with mock.patch(
+                "scripts.run_ccod_diagnostic.subprocess.Popen",
+                return_value=process,
+            ), mock.patch(
+                "scripts.run_ccod_diagnostic.monitor_worker",
+                side_effect=finish_worker,
+            ), self.assertRaisesRegex(RunnerAttemptError, "退出码非零"):
+                _launch_state_attempt(
+                    frozen_dir=root / "frozen",
+                    run_dir=run,
+                    cache_dir=root / "cache",
+                    config_path=root / "config.json",
+                    invocation=1,
+                    state_ordinal=0,
+                    attempt=1,
+                    remaining_state_s=1.0,
+                    execution_id=EXECUTION_ID,
+                    runner_hash="sha256:" + "90" * 32,
+                    frozen_snapshot_hash="sha256:" + "ab" * 32,
+                    parent_lease=lease,
+                    expected_query_keys=("sha256:" + "11" * 32,),
+                )
 
     def test_worker_report_rejects_wrong_invocation(self) -> None:
         """final report 必须绑定当前 invocation。"""
@@ -1015,6 +1264,70 @@ class ParentOrchestrationTest(unittest.TestCase):
             self.assertFalse(run.exists())
         launcher.assert_not_called()
 
+    def test_verify_only_cache_corruption_is_read_only(self) -> None:
+        """只读验收遇到坏 cache 必须失败，且不能创建 run-dir。"""
+        from algorithms.ccod.continuation import CounterfactualError
+
+        plan = _plan(query_count=1)
+
+        class CorruptCache(_FakeCache):
+            def load(self, identity):
+                del identity
+                raise CounterfactualError("合成坏 cache record")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            frozen = root / "frozen"
+            run = root / "run"
+            frozen.mkdir()
+            stack, launcher = self._patch_parent(plan, CorruptCache())
+            with stack, self.assertRaisesRegex(RunnerAttemptError, "合成坏"):
+                run_diagnostic(
+                    frozen_dir=frozen,
+                    run_dir=run,
+                    verify_only=True,
+                )
+            self.assertFalse(run.exists())
+        launcher.assert_not_called()
+
+    def test_cache_corruption_becomes_sticky_invalid_after_lock(self) -> None:
+        """普通运行的坏 cache 必须落盘为 invalid，修复后也不能洗白。"""
+        from algorithms.ccod.continuation import CounterfactualError
+
+        plan = _plan(query_count=1)
+
+        class ToggleCache(_FakeCache):
+            corrupt = True
+
+            def load(self, identity):
+                if self.corrupt:
+                    raise CounterfactualError("合成坏 cache record")
+                return super().load(identity)
+
+        cache = ToggleCache()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            frozen = root / "frozen"
+            run = root / "run"
+            frozen.mkdir()
+            stack, launcher = self._patch_parent(plan, cache)
+            with stack:
+                first = run_diagnostic(frozen_dir=frozen, run_dir=run)
+            launcher.assert_not_called()
+            self.assertEqual(first["status"], "invalid")
+            self.assertIn("cache_corrupt", first["failure"])
+            summary = json.loads(
+                (run / "signal_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["execution_status"], "invalid")
+            self.assertEqual(summary["failure_counts"], {"cache_corrupt": 1})
+
+            cache.corrupt = False
+            stack, second_launcher = self._patch_parent(plan, cache)
+            with stack, self.assertRaisesRegex(CCODRunnerError, "新的 run-dir"):
+                run_diagnostic(frozen_dir=frozen, run_dir=run)
+        second_launcher.assert_not_called()
+
     def test_all_cache_hits_skip_parent_spawn(self) -> None:
         plan = _plan(query_count=2)
         cache = _FakeCache(
@@ -1031,6 +1344,23 @@ class ParentOrchestrationTest(unittest.TestCase):
             stack, launcher = self._patch_parent(plan, cache)
             with stack:
                 result = run_diagnostic(frozen_dir=frozen, run_dir=run)
+            evidence = result["artifact_evidence"]
+            query_path = run / "query_results.jsonl"
+            summary_path = run / "signal_summary.json"
+            self.assertEqual(evidence["query_results"]["row_count"], 2)
+            self.assertEqual(
+                evidence["query_results"]["sha256"],
+                "sha256:" + hashlib.sha256(query_path.read_bytes()).hexdigest(),
+            )
+            summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                evidence["signal_summary"]["sha256"],
+                "sha256:" + hashlib.sha256(summary_path.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                evidence["signal_summary"]["summary_hash"],
+                summary_payload["summary_hash"],
+            )
         launcher.assert_not_called()
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["newly_started_states"], 0)
@@ -1209,6 +1539,18 @@ class ParentOrchestrationTest(unittest.TestCase):
                     run_dir=run,
                     max_states=1,
                 )
+            evidence_roots = [
+                run / "evidence" / f"invocation_{value:03d}"
+                for value in (1, 2)
+            ]
+            for evidence_root in evidence_roots:
+                self.assertTrue((evidence_root / "evidence.json").is_file())
+                self.assertTrue((evidence_root / "query_results.jsonl").is_file())
+                self.assertTrue((evidence_root / "signal_summary.json").is_file())
+            self.assertNotEqual(
+                (evidence_roots[0] / "query_results.jsonl").read_bytes(),
+                (evidence_roots[1] / "query_results.jsonl").read_bytes(),
+            )
         hot_launcher.assert_not_called()
         self.assertEqual(first["completed_states"], 1)
         self.assertEqual(second["invocation"], 2)
@@ -1248,6 +1590,70 @@ class ParentOrchestrationTest(unittest.TestCase):
                 first.close()
             second = _acquire_run_lock(run, EXECUTION_ID)
             second.close()
+
+    def test_run_lock_releases_after_progress_restore_error(self) -> None:
+        """持锁区早期异常即使保留 traceback，也必须立即释放 flock。"""
+        plan = _plan(query_count=1)
+        cache = _FakeCache()
+        retained = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            frozen = root / "frozen"
+            run = root / "run"
+            frozen.mkdir()
+            stack, launcher = self._patch_parent(plan, cache)
+            with stack, mock.patch(
+                "scripts.run_ccod_diagnostic._restore_state_progress",
+                side_effect=RuntimeError("合成进度恢复故障"),
+            ):
+                try:
+                    run_diagnostic(frozen_dir=frozen, run_dir=run)
+                except RuntimeError as exc:
+                    retained.append(exc)
+            launcher.assert_not_called()
+            self.assertIsNotNone(retained[0].__traceback__)
+            probe = _acquire_run_lock(run, EXECUTION_ID)
+            probe.close()
+
+    def test_run_lock_releases_after_final_manifest_write_error(self) -> None:
+        """收尾发布异常不能让 traceback 继续占有父进程锁。"""
+        import importlib
+
+        runner_module = importlib.import_module("scripts.run_ccod_diagnostic")
+        real_write_json = runner_module._write_json
+        plan = _plan(query_count=1)
+        query = plan.query_rows[0]
+        cache = _FakeCache(
+            {query["query_key"]: _FakeResult(query["query_key"]).to_manifest()}
+        )
+        retained = []
+
+        def fail_final_manifest(path, payload, hash_field):
+            if (
+                Path(path).name == "execution_manifest.json"
+                and payload.get("status") != "running"
+            ):
+                raise RuntimeError("合成最终清单写入故障")
+            return real_write_json(path, payload, hash_field)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            frozen = root / "frozen"
+            run = root / "run"
+            frozen.mkdir()
+            stack, launcher = self._patch_parent(plan, cache)
+            with stack, mock.patch(
+                "scripts.run_ccod_diagnostic._write_json",
+                side_effect=fail_final_manifest,
+            ):
+                try:
+                    run_diagnostic(frozen_dir=frozen, run_dir=run)
+                except RuntimeError as exc:
+                    retained.append(exc)
+            launcher.assert_not_called()
+            self.assertIsNotNone(retained[0].__traceback__)
+            probe = _acquire_run_lock(run, EXECUTION_ID)
+            probe.close()
 
 
 class FrozenPlanIntegrationTest(unittest.TestCase):

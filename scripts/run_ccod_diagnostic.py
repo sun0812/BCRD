@@ -21,7 +21,9 @@ import os
 from pathlib import Path
 import platform
 import resource
+import secrets
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -98,6 +100,7 @@ FROZEN_MAX_ATTEMPTS = 2
 FROZEN_QUERY_TIMEOUT_S = 120.0
 FROZEN_STATE_TIMEOUT_S = 1200.0
 FROZEN_RSS_LIMIT_MIB = 6144.0
+MAX_CACHE_RECORD_BYTES = 4 * 1024 * 1024
 RECOVERABLE_FAILURE_KINDS = frozenset(
     {
         "query_timeout",
@@ -153,6 +156,18 @@ class WorkerOutcome:
     stdout: str
     stderr: str
     peak_rss_mib: float
+
+
+@dataclass(frozen=True)
+class RunLockLease:
+    """父进程持有的运行锁及其一次性租约身份。"""
+
+    handle: Any
+    payload: Mapping[str, Any]
+
+    def close(self) -> None:
+        """释放内核锁；保留与旧文件句柄相同的调用接口。"""
+        self.handle.close()
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -327,6 +342,28 @@ def _write_json_exclusive(
     return record
 
 
+def _publish_hardlink_exclusive(source: Path, target: Path) -> None:
+    """把当前原子文件以 hard-link 固化为不可覆盖的 invocation 证据。"""
+    if source.is_symlink() or not source.is_file():
+        raise CCODRunnerError(f"证据来源必须是普通文件: {source}")
+    if target.is_symlink():
+        raise CCODRunnerError(f"证据目标不得为符号链接: {target}")
+    _reject_symlink_components(source.parent, label="证据来源目录")
+    _reject_symlink_components(target.parent, label="证据目标目录")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, target, follow_symlinks=False)
+    except FileExistsError as exc:
+        raise CCODRunnerError(f"invocation 证据已存在，拒绝覆盖: {target}") from exc
+    except OSError as exc:
+        raise CCODRunnerError(f"无法固化 invocation 证据 {target}: {exc}") from exc
+    directory_fd = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
     """按调用方给定顺序原子重建 JSONL。"""
     body = b"".join(_canonical_bytes(dict(row)) + b"\n" for row in rows)
@@ -356,8 +393,8 @@ def _read_json(path: Path) -> Dict[str, Any]:
     return value
 
 
-def _acquire_run_lock(run_dir: Path, execution_id: str) -> Any:
-    """用内核 flock 保证同一 run dir 同时只有一个父进程。"""
+def _acquire_run_lock(run_dir: Path, execution_id: str) -> RunLockLease:
+    """获取父进程独占锁，并生成只属于本次持锁期的随机租约。"""
     lock_path = run_dir / ".runner.lock"
     if lock_path.is_symlink():
         raise CCODRunnerError(f"运行锁不得为符号链接: {lock_path}")
@@ -371,18 +408,23 @@ def _acquire_run_lock(run_dir: Path, execution_id: str) -> Any:
         handle = os.fdopen(descriptor, "r+b", buffering=0)
         descriptor = None
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        payload = _canonical_bytes(
-            {
-                "execution_id": execution_id,
-                "pid": os.getpid(),
-                "acquired_unix_ns": time.time_ns(),
-            }
-        ) + b"\n"
+        lock_stat = os.fstat(handle.fileno())
+        lease_payload: Dict[str, Any] = {
+            "schema_version": "eosbench-ccod-parent-lease-v1",
+            "execution_id": execution_id,
+            "parent_pid": os.getpid(),
+            "lease_id": secrets.token_hex(32),
+            "lock_device": int(lock_stat.st_dev),
+            "lock_inode": int(lock_stat.st_ino),
+            "acquired_unix_ns": time.time_ns(),
+        }
+        lease_payload["lease_hash"] = _sha256_json(lease_payload)
+        payload = _canonical_bytes(lease_payload) + b"\n"
         handle.seek(0)
         handle.truncate(0)
         handle.write(payload)
         os.fsync(handle.fileno())
-        return handle
+        return RunLockLease(handle=handle, payload=dict(lease_payload))
     except BlockingIOError as exc:
         if handle is not None:
             handle.close()
@@ -395,6 +437,126 @@ def _acquire_run_lock(run_dir: Path, execution_id: str) -> Any:
         elif descriptor is not None:
             os.close(descriptor)
         raise CCODRunnerError(f"无法获取运行目录锁: {exc}") from exc
+
+
+def _validated_parent_lease(
+    payload: Mapping[str, Any], execution_id: str
+) -> Dict[str, Any]:
+    """严格验收父锁租约字段与自哈希。"""
+    expected_fields = {
+        "schema_version",
+        "execution_id",
+        "parent_pid",
+        "lease_id",
+        "lock_device",
+        "lock_inode",
+        "acquired_unix_ns",
+        "lease_hash",
+    }
+    if set(payload) != expected_fields:
+        raise RunnerAttemptError("identity_mismatch", "父进程租约字段集非法")
+    parent_pid = payload.get("parent_pid")
+    lease_id = payload.get("lease_id")
+    integer_fields = (
+        parent_pid,
+        payload.get("lock_device"),
+        payload.get("lock_inode"),
+        payload.get("acquired_unix_ns"),
+    )
+    if (
+        payload.get("schema_version") != "eosbench-ccod-parent-lease-v1"
+        or payload.get("execution_id") != execution_id
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in integer_fields
+        )
+        or not isinstance(lease_id, str)
+        or len(lease_id) != 64
+    ):
+        raise RunnerAttemptError("identity_mismatch", "父进程租约身份非法")
+    try:
+        bytes.fromhex(lease_id)
+    except ValueError as exc:
+        raise RunnerAttemptError("identity_mismatch", "父进程 lease_id 非法") from exc
+    unhashed = {key: value for key, value in payload.items() if key != "lease_hash"}
+    if payload.get("lease_hash") != _sha256_json(unhashed):
+        raise RunnerAttemptError("hash_mismatch", "父进程租约哈希不一致")
+    return dict(payload)
+
+
+def _assert_parent_lease(
+    run_dir: Path,
+    execution_id: str,
+    expected_lease: Mapping[str, Any],
+    *,
+    require_direct_parent: bool = True,
+) -> None:
+    """确认 worker 的直接父进程仍持有同一 inode 上的独占 flock。"""
+    expected = _validated_parent_lease(expected_lease, execution_id)
+    parent_pid = int(expected["parent_pid"])
+    if require_direct_parent and os.getppid() != parent_pid:
+        raise RunnerAttemptError("identity_mismatch", "worker 已失去授权父进程")
+
+    lock_path = run_dir / ".runner.lock"
+    if lock_path.is_symlink():
+        raise RunnerAttemptError("identity_mismatch", "父进程运行锁变成符号链接")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(lock_path, flags)
+        lock_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(lock_stat.st_mode)
+            or int(lock_stat.st_dev) != int(expected["lock_device"])
+            or int(lock_stat.st_ino) != int(expected["lock_inode"])
+        ):
+            raise RunnerAttemptError("identity_mismatch", "父进程运行锁文件身份漂移")
+        raw = os.read(descriptor, 8193)
+        if len(raw) > 8192:
+            raise RunnerAttemptError("identity_mismatch", "父进程租约文件异常过大")
+
+        def reject_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+            value: Dict[str, Any] = {}
+            for key, item in pairs:
+                if key in value:
+                    raise RunnerAttemptError(
+                        "identity_mismatch", f"父进程租约含重复键: {key}"
+                    )
+                value[key] = item
+            return value
+
+        try:
+            actual = json.loads(
+                raw.decode("utf-8"), object_pairs_hook=reject_duplicates
+            )
+        except RunnerAttemptError:
+            raise
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RunnerAttemptError(
+                "identity_mismatch", "父进程租约文件不是规范 JSON"
+            ) from exc
+        if not isinstance(actual, dict):
+            raise RunnerAttemptError("identity_mismatch", "父进程租约不是 object")
+        if _validated_parent_lease(actual, execution_id) != expected:
+            raise RunnerAttemptError("identity_mismatch", "父进程租约已经换代")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # 只有父进程仍持有另一 open-file description 的独占锁才会到这里。
+            return
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            raise RunnerAttemptError("identity_mismatch", "父进程已释放运行锁")
+    except RunnerAttemptError:
+        raise
+    except OSError as exc:
+        raise RunnerAttemptError(
+            "identity_mismatch", f"无法验证父进程运行锁: {exc}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def require_frozen_runtime() -> Dict[str, Any]:
@@ -511,8 +673,19 @@ def _prepare_cache_root(root: Path) -> Path:
 class _SecureCounterfactualLabelCache:
     """用 dirfd/O_NOFOLLOW 封装冻结 cache schema，防止 shard 链接逃逸。"""
 
-    def __init__(self, root: str | Path) -> None:
-        self.root = Path(root).resolve(strict=False)
+    def __init__(
+        self,
+        root: str | Path,
+        publication_guard: Optional[Callable[[], None]] = None,
+    ) -> None:
+        raw_root = Path(root).expanduser()
+        if not raw_root.is_absolute():
+            raw_root = Path.cwd() / raw_root
+        if raw_root.is_symlink():
+            raise CCODRunnerError(f"cache 根目录不允许符号链接: {raw_root}")
+        _reject_symlink_components(raw_root.parent, label="cache 父目录")
+        self.root = raw_root.resolve(strict=False)
+        self._publication_guard = publication_guard or (lambda: None)
 
     @staticmethod
     def _parts(identity: Mapping[str, Any]) -> Tuple[Dict[str, Any], str, str, str]:
@@ -573,7 +746,7 @@ class _SecureCounterfactualLabelCache:
 
         try:
             record = json.load(handle, object_pairs_hook=reject_duplicates)
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise CounterfactualError(f"无法读取 cache record {path_label}: {exc}") from exc
         if not isinstance(record, dict) or set(record) != {
             "schema_version",
@@ -613,15 +786,31 @@ class _SecureCounterfactualLabelCache:
             shard_fd = self._open_shard(root_fd, shard, create=False)
             if shard_fd is None:
                 return None
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            record_fd: Optional[int] = None
             try:
                 record_fd = os.open(filename, flags, dir_fd=shard_fd)
             except FileNotFoundError:
                 return None
             except OSError as exc:
                 raise CounterfactualError(f"cache record 不安全 {filename}: {exc}") from exc
-            with os.fdopen(record_fd, "r", encoding="utf-8") as handle:
-                record = self._decode_record(handle, f"{shard}/{filename}")
+            try:
+                record_stat = os.fstat(record_fd)
+                if (
+                    not stat.S_ISREG(record_stat.st_mode)
+                    or record_stat.st_size < 0
+                    or record_stat.st_size > MAX_CACHE_RECORD_BYTES
+                ):
+                    raise CounterfactualError(
+                        f"cache record 不是有界普通文件: {shard}/{filename}"
+                    )
+                with os.fdopen(record_fd, "r", encoding="utf-8") as handle:
+                    record_fd = None
+                    record = self._decode_record(handle, f"{shard}/{filename}")
+            finally:
+                if record_fd is not None:
+                    os.close(record_fd)
             if record["cache_key"] != key or record["identity"] != normalized:
                 raise CounterfactualError(f"cache identity 不一致: {shard}/{filename}")
             return dict(record["result"])
@@ -673,6 +862,8 @@ class _SecureCounterfactualLabelCache:
             finally:
                 os.close(temp_fd)
             try:
+                # 将父租约复核尽量贴近唯一产生权威记录的 hard-link。
+                self._publication_guard()
                 os.link(
                     temporary,
                     filename,
@@ -701,9 +892,12 @@ class _SecureCounterfactualLabelCache:
             os.close(root_fd)
 
 
-def _open_label_cache(root: str | Path) -> _SecureCounterfactualLabelCache:
+def _open_label_cache(
+    root: str | Path,
+    publication_guard: Optional[Callable[[], None]] = None,
+) -> _SecureCounterfactualLabelCache:
     """统一创建 runner 专用的安全 cache 视图。"""
-    return _SecureCounterfactualLabelCache(root)
+    return _SecureCounterfactualLabelCache(root, publication_guard)
 
 
 def _peak_rss_mib() -> float:
@@ -825,14 +1019,23 @@ def execute_state_worker(
     query_timeout_s: float = FROZEN_QUERY_TIMEOUT_S,
     runtime_factory: Optional[Callable[[Any, int], Any]] = None,
     rss_limit_mib: float = FROZEN_RSS_LIMIT_MIB,
+    authorization_check: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """缓存优先执行一个完整状态，存在 miss 时只 restore/prepare 一次。"""
+    assert_authorized = authorization_check or (lambda: None)
+
+    def authorized_heartbeat(event: str, details: Mapping[str, Any]) -> None:
+        """任何运行证据写入前都重新确认父锁仍然有效。"""
+        assert_authorized()
+        heartbeat(event, details)
+
+    assert_authorized()
     queries = tuple(plan.queries_by_state[state_ordinal])
     cached_at_start = _load_cached_group(plan, state_ordinal, cache)
     missing = [
         query for query in queries if str(query["query_key"]) not in cached_at_start
     ]
-    heartbeat(
+    authorized_heartbeat(
         "state_start",
         {
             "state_ordinal": state_ordinal,
@@ -850,7 +1053,7 @@ def execute_state_worker(
             "fresh_query_keys": [],
             "peak_rss_mib": _peak_rss_mib(),
         }
-        heartbeat("state_complete", report)
+        authorized_heartbeat("state_complete", report)
         return report
 
     actual_factory = (
@@ -874,7 +1077,7 @@ def execute_state_worker(
         # 与 evaluate 紧邻地再次检查，支持中断恢复或另一 writer 已发布同 key。
         if _cache_load(cache, identity) is not None:
             continue
-        heartbeat(
+        authorized_heartbeat(
             "query_start",
             {
                 "state_ordinal": state_ordinal,
@@ -906,6 +1109,9 @@ def execute_state_worker(
                     "identity_mismatch",
                     "Oracle 结果 forced_action_key 偏离冻结计划",
                 )
+            # evaluate 可能持续较久；只有当前父进程仍持有本次随机租约，
+            # 才允许把结果发布到权威内容寻址 cache。
+            assert_authorized()
             _cache_store(cache, identity, result)
             reloaded = _cache_load(cache, identity)
             if reloaded is None or reloaded != manifest:
@@ -917,7 +1123,7 @@ def execute_state_worker(
         peak_rss = max(peak_rss, _peak_rss_mib())
         if peak_rss > rss_limit_mib:
             raise CCODRunnerError("worker 查询后超过 RSS 上限")
-        heartbeat(
+        authorized_heartbeat(
             "query_complete",
             {
                 "state_ordinal": state_ordinal,
@@ -940,7 +1146,7 @@ def execute_state_worker(
         "fresh_query_keys": evaluated,
         "peak_rss_mib": peak_rss,
     }
-    heartbeat("state_complete", report)
+    authorized_heartbeat("state_complete", report)
     return report
 
 
@@ -1071,6 +1277,8 @@ def _worker_command(
     execution_id: str,
     runner_hash: str,
     invocation: int,
+    parent_pid: int,
+    parent_lease_id: str,
     frozen_snapshot_hash: Optional[str] = None,
 ) -> List[str]:
     """构造一次性 worker 命令；首项固定为当前解释器。"""
@@ -1098,6 +1306,10 @@ def _worker_command(
         execution_id,
         "--runner-hash",
         runner_hash,
+        "--parent-pid",
+        str(parent_pid),
+        "--parent-lease-id",
+        parent_lease_id,
     ]
     if frozen_snapshot_hash is not None:
         command.extend(["--frozen-snapshot-hash", frozen_snapshot_hash])
@@ -1134,49 +1346,68 @@ def _real_runtime_factory(plan: Any, state_ordinal: int) -> Tuple[Any, Any, Any]
         ConstraintConfig,
         EnumeratorConfig,
         ObjectiveConfig,
+        StateReplayError,
         restore_state,
     )
-
-    state = plan.selected_states[state_ordinal]
-    canonical = state["canonical_source"]
-    scenario_path = _safe_file(
-        REPO_ROOT,
-        canonical["scenario_ref"]["relative_path"],
-        label="scenario_ref",
-    )
-    trace_path = _safe_file(
-        plan.frozen_dir,
-        canonical["trace_ref"]["relative_path"],
-        label="trace_ref",
-    )
-    trace = _read_json(trace_path)
-    problem = load_scheduling_problem_from_json(scenario_path)
-    constraint = ConstraintConfig.from_payload(trace["constraint_config"])
-    enumerator = EnumeratorConfig.from_payload(trace["enumerator_config"])
-    objective = ObjectiveConfig.from_payload(trace["objective_config"])
-    for field_name, actual in (
-        ("constraint_hash", constraint.hash),
-        ("enumerator_hash", enumerator.hash),
-        ("objective_hash", objective.hash),
-    ):
-        if state.get(field_name) != actual or trace.get(field_name) != actual:
-            raise CCODRunnerError(f"state/trace 的 {field_name} 不一致")
-    replayed = restore_state(
-        problem,
-        trace,
-        _mutable_json_copy(canonical["state_manifest"]),
-        scenario_path=scenario_path,
-        verify=True,
-    )
-    if replayed.state_manifest.get("state_hash") != state.get("state_hash"):
-        raise CCODRunnerError("restore 后 state_hash 偏离冻结计划")
-    oracle = ContinuationOracle(
-        problem,
-        constraint_config=constraint,
-        enumerator_config=enumerator,
-        objective_config=objective,
-    )
-    return oracle, oracle.prepare(replayed), _continuation_for_plan(plan)
+    try:
+        state = plan.selected_states[state_ordinal]
+        canonical = state["canonical_source"]
+        scenario_path = _safe_file(
+            REPO_ROOT,
+            canonical["scenario_ref"]["relative_path"],
+            label="scenario_ref",
+        )
+        trace_path = _safe_file(
+            plan.frozen_dir,
+            canonical["trace_ref"]["relative_path"],
+            label="trace_ref",
+        )
+        trace = _read_json(trace_path)
+        problem = load_scheduling_problem_from_json(scenario_path)
+        constraint = ConstraintConfig.from_payload(trace["constraint_config"])
+        enumerator = EnumeratorConfig.from_payload(trace["enumerator_config"])
+        objective = ObjectiveConfig.from_payload(trace["objective_config"])
+        for field_name, actual in (
+            ("constraint_hash", constraint.hash),
+            ("enumerator_hash", enumerator.hash),
+            ("objective_hash", objective.hash),
+        ):
+            if state.get(field_name) != actual or trace.get(field_name) != actual:
+                raise RunnerAttemptError(
+                    "identity_mismatch",
+                    f"state/trace 的 {field_name} 不一致",
+                )
+        replayed = restore_state(
+            problem,
+            trace,
+            _mutable_json_copy(canonical["state_manifest"]),
+            scenario_path=scenario_path,
+            verify=True,
+        )
+        if replayed.state_manifest.get("state_hash") != state.get("state_hash"):
+            raise RunnerAttemptError(
+                "identity_mismatch",
+                "restore 后 state_hash 偏离冻结计划",
+            )
+        oracle = ContinuationOracle(
+            problem,
+            constraint_config=constraint,
+            enumerator_config=enumerator,
+            objective_config=objective,
+        )
+        return oracle, oracle.prepare(replayed), _continuation_for_plan(plan)
+    except RunnerAttemptError:
+        raise
+    except OSError as exc:
+        raise RunnerAttemptError(
+            "frozen_drift",
+            f"冻结来源在 worker 恢复时不可读: {exc}",
+        ) from exc
+    except (CCODRunnerError, StateReplayError, KeyError, TypeError, ValueError) as exc:
+        raise RunnerAttemptError(
+            "identity_mismatch",
+            f"冻结 state 重放身份校验失败: {exc}",
+        ) from exc
 
 
 def runner_implementation_hash() -> str:
@@ -1380,6 +1611,7 @@ def _worker_main(args: argparse.Namespace) -> int:
     """执行一个 state 后退出；失败时不复用进程。"""
     run: Optional[Path] = None
     parent_authorized = False
+    parent_lease_check: Optional[Callable[[], None]] = None
     try:
         require_frozen_runtime()
         frozen, run, cache_dir = validate_external_paths(
@@ -1462,6 +1694,26 @@ def _worker_main(args: argparse.Namespace) -> int:
             or int(active_progress["active_started_unix_ns"]) <= 0
         ):
             raise CCODRunnerError("worker attempt 未绑定父进程当前 active 状态")
+        manifest_lease = manifest.get("parent_lease")
+        if not isinstance(manifest_lease, Mapping):
+            raise CCODRunnerError("父进程 manifest 缺少运行锁租约")
+        validated_lease = _validated_parent_lease(
+            manifest_lease,
+            str(args.execution_id),
+        )
+        if (
+            isinstance(args.parent_pid, bool)
+            or not isinstance(args.parent_pid, int)
+            or args.parent_pid != validated_lease["parent_pid"]
+            or args.parent_lease_id != validated_lease["lease_id"]
+        ):
+            raise CCODRunnerError("worker 参数与父进程租约身份不一致")
+        parent_lease_check = lambda: _assert_parent_lease(
+            run,
+            str(args.execution_id),
+            validated_lease,
+        )
+        parent_lease_check()
         if _frozen_snapshot(frozen).get("snapshot_hash") != args.frozen_snapshot_hash:
             raise CCODRunnerError("worker 启动时冻结包 snapshot 漂移")
         from algorithms.ccod.execution import (
@@ -1482,19 +1734,27 @@ def _worker_main(args: argparse.Namespace) -> int:
         # 只有完整绑定父进程、冻结快照、invocation 与执行身份后，
         # worker 才获得在外部运行目录写入 journal/report 的权限。
         parent_authorized = True
+        parent_lease_check()
+        worker_cache = _open_label_cache(
+            cache_dir,
+            publication_guard=parent_lease_check,
+        )
+        parent_lease_check()
+        heartbeat = _heartbeat_journal(
+            run,
+            execution_id=args.execution_id,
+            invocation=args.invocation,
+            state_ordinal=args.state_ordinal,
+            attempt=args.attempt,
+        )
         report = execute_state_worker(
             plan,
             args.state_ordinal,
-            _open_label_cache(cache_dir),
-            _heartbeat_journal(
-                run,
-                execution_id=args.execution_id,
-                invocation=args.invocation,
-                state_ordinal=args.state_ordinal,
-                attempt=args.attempt,
-            ),
+            worker_cache,
+            heartbeat,
             query_timeout_s=args.query_timeout_s,
             rss_limit_mib=FROZEN_RSS_LIMIT_MIB,
+            authorization_check=parent_lease_check,
         )
         report.update(
             {
@@ -1507,6 +1767,7 @@ def _worker_main(args: argparse.Namespace) -> int:
                 "status": "success",
             }
         )
+        parent_lease_check()
         _write_json_exclusive(
             _worker_report_path(
                 run,
@@ -1519,7 +1780,7 @@ def _worker_main(args: argparse.Namespace) -> int:
         )
         return 0
     except Exception as exc:
-        if parent_authorized and run is not None and all(
+        may_publish_failure = parent_authorized and run is not None and all(
             value is not None
             for value in (
                 args.execution_id,
@@ -1527,7 +1788,13 @@ def _worker_main(args: argparse.Namespace) -> int:
                 args.state_ordinal,
                 args.attempt,
             )
-        ):
+        )
+        if may_publish_failure and parent_lease_check is not None:
+            try:
+                parent_lease_check()
+            except Exception:
+                may_publish_failure = False
+        if may_publish_failure:
             failure = {
                 "schema_version": WORKER_REPORT_SCHEMA_VERSION,
                 "execution_id": args.execution_id,
@@ -1569,6 +1836,7 @@ def _verify_worker_report(
     invocation: int,
     state_ordinal: int,
     attempt: int,
+    expected_query_keys: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """父进程验收 worker final report。"""
     if not path.is_file():
@@ -1662,6 +1930,18 @@ def _verify_worker_report(
             "identity_mismatch",
             "worker success report 查询计数非法",
         )
+    if expected_query_keys is not None:
+        expected_keys = tuple(str(key) for key in expected_query_keys)
+        expected_set = set(expected_keys)
+        if (
+            len(expected_set) != len(expected_keys)
+            or planned != len(expected_keys)
+            or any(key not in expected_set for key in fresh_keys)
+        ):
+            raise RunnerAttemptError(
+                "identity_mismatch",
+                "worker success report 偏离当前 state 的冻结 query 集",
+            )
     return payload
 
 
@@ -1678,8 +1958,11 @@ def _launch_state_attempt(
     execution_id: str,
     runner_hash: str,
     frozen_snapshot_hash: str,
+    parent_lease: Mapping[str, Any],
+    expected_query_keys: Sequence[str],
 ) -> Dict[str, Any]:
     """启动并监控一个 state attempt。"""
+    validated_lease = _validated_parent_lease(parent_lease, execution_id)
     _reject_symlink_components(run_dir / "workers", label="worker 报告目录")
     report_path = _worker_report_path(
         run_dir,
@@ -1703,6 +1986,8 @@ def _launch_state_attempt(
         execution_id=execution_id,
         runner_hash=runner_hash,
         invocation=invocation,
+        parent_pid=int(validated_lease["parent_pid"]),
+        parent_lease_id=str(validated_lease["lease_id"]),
         frozen_snapshot_hash=frozen_snapshot_hash,
     )
     environment = dict(os.environ)
@@ -1749,7 +2034,7 @@ def _launch_state_attempt(
             f"worker 护栏触发: {outcome.violation}",
         )
     if report_path.is_file():
-        return _verify_worker_report(
+        report = _verify_worker_report(
             report_path,
             execution_id=execution_id,
             runner_hash=runner_hash,
@@ -1757,7 +2042,14 @@ def _launch_state_attempt(
             invocation=invocation,
             state_ordinal=state_ordinal,
             attempt=attempt,
+            expected_query_keys=expected_query_keys,
         )
+        if outcome.returncode != 0:
+            raise RunnerAttemptError(
+                "worker_exit",
+                "worker 虽发布 success report，但进程退出码非零",
+            )
+        return report
     if outcome.returncode != 0:
         detail = outcome.stderr.strip()[-2000:]
         raise RunnerAttemptError(
@@ -2090,13 +2382,17 @@ def run_diagnostic(
     existing = _existing_manifest(run) if run.is_dir() else None
     _validate_resumable_manifest(existing, execution_id, identity)
     cache = _open_label_cache(cache_path)
-    initially_cached = {
-        str(query["query_key"])
-        for query in plan.query_rows
-        if cache.load(_mutable_json_copy(query["query_identity"])) is not None
-    }
 
     if verify_only:
+        initially_cached = {
+            str(query["query_key"])
+            for query in plan.query_rows
+            if _cache_load(
+                cache,
+                _mutable_json_copy(query["query_identity"]),
+            )
+            is not None
+        }
         rows = _result_rows_from_cache(
             plan,
             cache,
@@ -2127,13 +2423,57 @@ def run_diagnostic(
 
     run.mkdir(parents=True, exist_ok=True)
     run_lock = _acquire_run_lock(run, execution_id)
+    try:
+        return _run_diagnostic_locked(
+            runtime=runtime,
+            frozen=frozen,
+            run=run,
+            cache_path=cache_path,
+            config=config,
+            frozen_snapshot=frozen_snapshot,
+            runner_hash=runner_hash,
+            verification=verification,
+            plan=plan,
+            state_count=state_count,
+            state_ordinals=state_ordinals,
+            identity=identity,
+            execution_id=execution_id,
+            cache=cache,
+            run_lock=run_lock,
+            summarize_signal_gate=summarize_signal_gate,
+            max_states=max_states,
+            max_new_states=max_new_states,
+        )
+    finally:
+        # 必须覆盖持锁区内的 BaseException；异常 traceback 也不能继续持有 flock。
+        run_lock.close()
+
+
+def _run_diagnostic_locked(
+    *,
+    runtime: Mapping[str, Any],
+    frozen: Path,
+    run: Path,
+    cache_path: Path,
+    config: Path,
+    frozen_snapshot: Mapping[str, Any],
+    runner_hash: str,
+    verification: Mapping[str, Any],
+    plan: Any,
+    state_count: int,
+    state_ordinals: Sequence[int],
+    identity: Mapping[str, Any],
+    execution_id: str,
+    cache: Any,
+    run_lock: RunLockLease,
+    summarize_signal_gate: Callable[..., Dict[str, Any]],
+    max_states: Optional[int],
+    max_new_states: int,
+) -> Dict[str, Any]:
+    """在父进程已持有 run lock 时恢复、执行并发布一次 invocation。"""
     # 上锁后重新读取，避免两个父进程在只读预检与写清单之间发生 TOCTOU。
     existing = _existing_manifest(run)
-    try:
-        _validate_resumable_manifest(existing, execution_id, identity)
-    except Exception:
-        run_lock.close()
-        raise
+    _validate_resumable_manifest(existing, execution_id, identity)
     if existing is None:
         unexpected = [
             path
@@ -2141,7 +2481,6 @@ def run_diagnostic(
             if path.name not in {".DS_Store", ".runner.lock"}
         ]
         if unexpected:
-            run_lock.close()
             raise CCODRunnerError("非空运行目录缺少 execution manifest")
         invocation = 1
     else:
@@ -2151,7 +2490,6 @@ def run_diagnostic(
             or not isinstance(previous_invocation, int)
             or previous_invocation <= 0
         ):
-            run_lock.close()
             raise CCODRunnerError("execution manifest 的 invocation 非法")
         invocation = previous_invocation + 1
     progress = _restore_state_progress(existing, state_count)
@@ -2170,6 +2508,7 @@ def run_diagnostic(
             "cache_dir": str(cache_path),
         },
         "cache_is_source_of_truth": True,
+        "parent_lease": dict(run_lock.payload),
         "invocation": invocation,
         "max_states_this_invocation": max_states,
         "max_new_states_this_invocation": max_new_states,
@@ -2186,8 +2525,20 @@ def run_diagnostic(
     reports: List[Dict[str, Any]] = []
     pending_error: Optional[RunnerAttemptError] = None
     newly_started_states = 0
+    initially_cached: Set[str] = set()
 
     try:
+        # 普通运行必须先持锁并发布 running 清单，再扫描全部 cache。
+        # 这样任何坏记录都能进入统一 finalizer 并固化为粘性 invalid。
+        initially_cached = {
+            str(query["query_key"])
+            for query in plan.query_rows
+            if _cache_load(
+                cache,
+                _mutable_json_copy(query["query_identity"]),
+            )
+            is not None
+        }
         for state_ordinal in state_ordinals:
             if publish_state_checkpoint_if_complete(
                 plan,
@@ -2252,6 +2603,11 @@ def run_diagnostic(
                         execution_id=execution_id,
                         runner_hash=runner_hash,
                         frozen_snapshot_hash=frozen_snapshot["snapshot_hash"],
+                        parent_lease=run_lock.payload,
+                        expected_query_keys=tuple(
+                            str(query["query_key"])
+                            for query in plan.queries_by_state[state_ordinal]
+                        ),
                     )
                     if not publish_state_checkpoint_if_complete(
                         plan,
@@ -2318,9 +2674,14 @@ def run_diagnostic(
                 if pending_error is None and not final_error.recoverable:
                     pending_error = final_error
                 break
+    except RunnerAttemptError as exc:
+        if pending_error is None:
+            pending_error = exc
     finally:
         rows: List[Dict[str, Any]] = []
         summary: Dict[str, Any] = {}
+        summary_record: Dict[str, Any] = {}
+        artifact_evidence: Optional[Dict[str, Any]] = None
         try:
             terminal_failures = _terminal_failures_from_progress(
                 plan,
@@ -2370,9 +2731,8 @@ def run_diagnostic(
                 )
             else:
                 summary = summarize_signal_gate(plan, identity, rows)
-            _write_jsonl(run / "query_results.jsonl", rows)
-            _write_json(run / "signal_summary.json", summary, "summary_hash")
-            # gate 计算和结果写入期间也可能发生漂移；完整结果发布前再检查一次。
+            # 在写出唯一一版 summary 前完成最后一次漂移判定，禁止磁盘上
+            # 短暂或残留一个未被最终 manifest 接受的 complete gate。
             if pending_error is None or pending_error.recoverable:
                 late_drift = _runtime_drift_error(
                     frozen,
@@ -2393,11 +2753,56 @@ def run_diagnostic(
                             "scientific_results_hash": None,
                         }
                     )
-                    _write_json(
-                        run / "signal_summary.json",
-                        summary,
-                        "summary_hash",
-                    )
+            query_results_path = run / "query_results.jsonl"
+            summary_path = run / "signal_summary.json"
+            _write_jsonl(query_results_path, rows)
+            summary_record = _write_json(
+                summary_path,
+                summary,
+                "summary_hash",
+            )
+            evidence_root = run / "evidence" / f"invocation_{invocation:03d}"
+            immutable_query_path = evidence_root / "query_results.jsonl"
+            immutable_summary_path = evidence_root / "signal_summary.json"
+            _publish_hardlink_exclusive(query_results_path, immutable_query_path)
+            _publish_hardlink_exclusive(summary_path, immutable_summary_path)
+            immutable_artifacts = {
+                "query_results": {
+                    "relative_path": immutable_query_path.relative_to(run).as_posix(),
+                    "sha256": _sha256_file(immutable_query_path),
+                    "row_count": len(rows),
+                },
+                "signal_summary": {
+                    "relative_path": immutable_summary_path.relative_to(run).as_posix(),
+                    "sha256": _sha256_file(immutable_summary_path),
+                    "summary_hash": summary_record["summary_hash"],
+                    "scientific_results_hash": summary_record.get(
+                        "scientific_results_hash"
+                    ),
+                },
+            }
+            evidence_manifest_path = evidence_root / "evidence.json"
+            evidence_record = _write_json_exclusive(
+                evidence_manifest_path,
+                {
+                    "schema_version": "eosbench-ccod-invocation-evidence-v1",
+                    "execution_id": execution_id,
+                    "invocation": invocation,
+                    "runner_implementation_hash": runner_hash,
+                    "frozen_snapshot_hash": frozen_snapshot["snapshot_hash"],
+                    "execution_status": summary_record["execution_status"],
+                    "artifacts": immutable_artifacts,
+                },
+                "evidence_hash",
+            )
+            artifact_evidence = {
+                **immutable_artifacts,
+                "evidence_manifest": {
+                    "relative_path": evidence_manifest_path.relative_to(run).as_posix(),
+                    "sha256": _sha256_file(evidence_manifest_path),
+                    "evidence_hash": evidence_record["evidence_hash"],
+                },
+            }
         except Exception as exc:
             if pending_error is None:
                 pending_error = RunnerAttemptError("cache_corrupt", str(exc))
@@ -2417,6 +2822,7 @@ def run_diagnostic(
                 "signal_gate": summary.get("signal_gate", "not_evaluated"),
                 "method_decision": summary.get("method_decision"),
                 "failure": (
+                    f"{pending_error.failure_kind}: "
                     f"{type(pending_error).__name__}: {pending_error}"
                     if pending_error is not None
                     else None
@@ -2428,13 +2834,12 @@ def run_diagnostic(
                     for row in successful_rows
                 ),
                 "peak_parent_rss_mib": _peak_rss_mib(),
+                "artifact_evidence": artifact_evidence,
             }
         )
         _write_json(run / "execution_manifest.json", manifest, "manifest_hash")
 
-    final_manifest = _read_json(run / "execution_manifest.json")
-    run_lock.close()
-    return final_manifest
+    return _read_json(run / "execution_manifest.json")
 
 
 def _positive_int(text: str) -> int:
@@ -2506,6 +2911,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--execution-id", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--runner-hash", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--parent-pid", type=_positive_int, default=None, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--parent-lease-id", default=None, help=argparse.SUPPRESS
+    )
     parser.add_argument(
         "--frozen-snapshot-hash",
         default=None,

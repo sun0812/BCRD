@@ -225,6 +225,61 @@ def _cache_result(query, q_h):
     return payload
 
 
+def _rehash_result_row(row):
+    """在有意修改合成结果后重签外层 row_hash。"""
+    row.pop("row_hash", None)
+    row["row_hash"] = sha256_json(row)
+    return row
+
+
+def _success_result_row(query, execution_id, run_id, q_h, *, cache_hit=False):
+    """构造与 runner 公开 schema 完全一致的成功查询行。"""
+    return _rehash_result_row(
+        {
+            "schema_version": "eosbench-ccod-query-result-v1",
+            "execution_id": execution_id,
+            "run_id": run_id,
+            "query_key": query["query_key"],
+            "query_ordinal": query["query_ordinal"],
+            "state_ordinal": query["state_ordinal"],
+            "action_ordinal": query["action_ordinal"],
+            "state_hash": query["state_hash"],
+            "status": "success",
+            "cache_hit_at_invocation_start": bool(cache_hit),
+            "result": _cache_result(query, q_h),
+        }
+    )
+
+
+def _failed_result_row(
+    query,
+    execution_id,
+    run_id,
+    failure_kind,
+    *,
+    attempts_started=2,
+    state_budget_exhausted=False,
+):
+    """构造带真实终止证据的失败查询行。"""
+    return _rehash_result_row(
+        {
+            "schema_version": "eosbench-ccod-query-result-v1",
+            "execution_id": execution_id,
+            "run_id": run_id,
+            "query_key": query["query_key"],
+            "query_ordinal": query["query_ordinal"],
+            "state_ordinal": query["state_ordinal"],
+            "action_ordinal": query["action_ordinal"],
+            "state_hash": query["state_hash"],
+            "status": "failed",
+            "failure_kind": failure_kind,
+            "attempts_started": attempts_started,
+            "attempt_budget": 2,
+            "state_budget_exhausted": state_budget_exhausted,
+        }
+    )
+
+
 class FrozenDiagnosticPlanTest(unittest.TestCase):
     """验证纯加载器只接受闭合的 100/1570 冻结引用。"""
 
@@ -413,30 +468,24 @@ class SignalGateTest(unittest.TestCase):
                 else 0.0
             )
             rows.append(
-                {
-                    "execution_id": self.execution_id,
-                    "run_id": self.plan.run_id,
-                    "query_key": query["query_key"],
-                    "query_ordinal": query["query_ordinal"],
-                    "state_hash": query["state_hash"],
-                    "status": "success",
-                    "result": _cache_result(query, q_h),
-                }
+                _success_result_row(
+                    query,
+                    self.execution_id,
+                    self.plan.run_id,
+                    q_h,
+                )
             )
         return rows
 
     def _single_success(self, query_index=0, q_h=0.0):
         """构造一条严格绑定计划的成功结果。"""
         query = self.plan.query_rows[query_index]
-        return {
-            "execution_id": self.execution_id,
-            "run_id": self.plan.run_id,
-            "query_key": query["query_key"],
-            "query_ordinal": query["query_ordinal"],
-            "state_hash": query["state_hash"],
-            "status": "success",
-            "result": _cache_result(query, q_h),
-        }
+        return _success_result_row(
+            query,
+            self.execution_id,
+            self.plan.run_id,
+            q_h,
+        )
 
     def test_overall_boundary_is_59_of_97(self) -> None:
         passing_59 = set(range(29)) | set(range(50, 80))
@@ -542,12 +591,12 @@ class SignalGateTest(unittest.TestCase):
         for failure_kind in recoverable:
             with self.subTest(failure_kind=failure_kind):
                 rows = self._results(range(100))
-                rows[0].pop("result")
-                rows[0]["status"] = "failed"
-                rows[0]["failure_kind"] = failure_kind
-                rows[0]["attempts_started"] = 2
-                rows[0]["attempt_budget"] = 2
-                rows[0]["state_budget_exhausted"] = False
+                rows[0] = _failed_result_row(
+                    self.plan.query_rows[0],
+                    self.execution_id,
+                    self.plan.run_id,
+                    failure_kind,
+                )
                 summary = summarize_signal_gate(self.plan, self.identity, rows)
                 self.assertEqual(summary["execution_status"], "incomplete")
                 self.assertEqual(summary["signal_gate"], "not_evaluated")
@@ -565,17 +614,19 @@ class SignalGateTest(unittest.TestCase):
         for failure_kind in invalid_kinds:
             with self.subTest(failure_kind=failure_kind):
                 rows = self._results(range(100))
-                rows[0].pop("result")
-                rows[0]["status"] = "failed"
-                rows[0]["failure_kind"] = failure_kind
-                rows[0]["attempts_started"] = 1
-                rows[0]["attempt_budget"] = 2
-                rows[0]["state_budget_exhausted"] = False
+                rows[0] = _failed_result_row(
+                    self.plan.query_rows[0],
+                    self.execution_id,
+                    self.plan.run_id,
+                    failure_kind,
+                    attempts_started=1,
+                )
                 summary = summarize_signal_gate(self.plan, self.identity, rows)
                 self.assertEqual(summary["execution_status"], "invalid")
                 self.assertEqual(summary["signal_gate"], "not_evaluated")
 
         rows[0]["failure_kind"] = "invented_failure"
+        _rehash_result_row(rows[0])
         with self.assertRaisesRegex(CCODExecutionError, "failure_kind"):
             summarize_signal_gate(self.plan, self.identity, rows)
 
@@ -595,35 +646,50 @@ class SignalGateTest(unittest.TestCase):
                 if name != "result_hash"
             }
         )
+        _rehash_result_row(rows[0])
         with self.assertRaisesRegex(CCODExecutionError, "result"):
             summarize_signal_gate(self.plan, self.identity, rows)
 
         rows = self._results(range(100))
         rows[0]["result"]["result_hash"] = "sha256:" + "00" * 32
+        _rehash_result_row(rows[0])
         with self.assertRaisesRegex(CCODExecutionError, "result"):
             summarize_signal_gate(self.plan, self.identity, rows)
+
+    def test_query_result_outer_schema_and_hash_are_strict(self) -> None:
+        """外层结果行不得夹带字段、换 schema、改序号或破坏自哈希。"""
+        extra = self._single_success()
+        extra["unexpected"] = True
+        _rehash_result_row(extra)
+        with self.assertRaisesRegex(CCODExecutionError, "字段集合"):
+            summarize_signal_gate(self.plan, self.identity, [extra])
+
+        wrong_schema = self._single_success()
+        wrong_schema["schema_version"] = "invented-schema"
+        _rehash_result_row(wrong_schema)
+        with self.assertRaisesRegex(ExecutionIdentityError, "schema_version"):
+            summarize_signal_gate(self.plan, self.identity, [wrong_schema])
+
+        wrong_ordinal = self._single_success()
+        wrong_ordinal["state_ordinal"] = 99
+        _rehash_result_row(wrong_ordinal)
+        with self.assertRaisesRegex(CCODExecutionError, "ordinal/state"):
+            summarize_signal_gate(self.plan, self.identity, [wrong_ordinal])
+
+        wrong_hash = self._single_success()
+        wrong_hash["row_hash"] = "sha256:" + "00" * 32
+        with self.assertRaisesRegex(ExecutionIdentityError, "row_hash"):
+            summarize_signal_gate(self.plan, self.identity, [wrong_hash])
 
     def test_scientific_hash_ignores_cold_hot_operational_metadata(self) -> None:
         cold = self._results(range(59))
         hot = list(reversed([dict(row) for row in cold]))
-        for index, row in enumerate(cold):
-            row.update(
-                {
-                    "cache_hit": False,
-                    "cache_path": f"/cold/cache/{index}",
-                    "elapsed_s": 1.5,
-                    "completed_at": "2026-07-15T00:00:00Z",
-                }
-            )
-        for index, row in enumerate(hot):
-            row.update(
-                {
-                    "cache_hit": True,
-                    "cache_path": f"/hot/cache/{index}",
-                    "elapsed_s": 0.0,
-                    "completed_at": "2099-01-01T00:00:00Z",
-                }
-            )
+        for row in cold:
+            row["cache_hit_at_invocation_start"] = False
+            _rehash_result_row(row)
+        for row in hot:
+            row["cache_hit_at_invocation_start"] = True
+            _rehash_result_row(row)
         self.assertEqual(
             scientific_results_hash(self.plan, self.identity, cold),
             scientific_results_hash(self.plan, self.identity, hot),
@@ -634,11 +700,12 @@ class SignalGateTest(unittest.TestCase):
         flat = self._single_success()
         flat.pop("result")
         flat["q_h_hex"] = 0.0.hex()
-        with self.assertRaisesRegex(CCODExecutionError, "完整 cache result"):
+        with self.assertRaisesRegex(CCODExecutionError, "字段集合"):
             summarize_signal_gate(self.plan, self.identity, [flat])
 
         bad_hash = self._single_success()
         bad_hash["result"]["result_hash"] = "sha256:" + "ff" * 32
+        _rehash_result_row(bad_hash)
         with self.assertRaisesRegex(CCODExecutionError, "result_hash"):
             summarize_signal_gate(self.plan, self.identity, [bad_hash])
 
@@ -651,6 +718,7 @@ class SignalGateTest(unittest.TestCase):
                 if key != "result_hash"
             }
         )
+        _rehash_result_row(wrong_query)
         with self.assertRaisesRegex(CCODExecutionError, "query_key"):
             summarize_signal_gate(self.plan, self.identity, [wrong_query])
 
@@ -663,6 +731,7 @@ class SignalGateTest(unittest.TestCase):
                 if key != "result_hash"
             }
         )
+        _rehash_result_row(wrong_q)
         with self.assertRaisesRegex(CCODExecutionError, "q_h 与目标差值"):
             summarize_signal_gate(self.plan, self.identity, [wrong_q])
 
@@ -677,18 +746,12 @@ class SignalGateTest(unittest.TestCase):
             self.plan,
             self.identity,
             [
-                {
-                    "execution_id": self.execution_id,
-                    "run_id": self.plan.run_id,
-                    "query_key": query["query_key"],
-                    "query_ordinal": query["query_ordinal"],
-                    "state_hash": query["state_hash"],
-                    "status": "failed",
-                    "failure_kind": "query_timeout",
-                    "attempts_started": 2,
-                    "attempt_budget": 2,
-                    "state_budget_exhausted": False,
-                }
+                _failed_result_row(
+                    query,
+                    self.execution_id,
+                    self.plan.run_id,
+                    "query_timeout",
+                )
             ],
         )
         self.assertEqual(failed["execution_status"], "incomplete")
@@ -700,21 +763,17 @@ class SignalGateTest(unittest.TestCase):
     def test_recoverable_failure_requires_real_terminal_evidence(self) -> None:
         """未启动的第二次尝试不能被伪造成已耗尽；state deadline 可单独终止。"""
         query = self.plan.query_rows[0]
-        base = {
-            "execution_id": self.execution_id,
-            "run_id": self.plan.run_id,
-            "query_key": query["query_key"],
-            "query_ordinal": query["query_ordinal"],
-            "state_hash": query["state_hash"],
-            "status": "failed",
-            "failure_kind": "state_timeout",
-            "attempts_started": 1,
-            "attempt_budget": 2,
-            "state_budget_exhausted": False,
-        }
+        base = _failed_result_row(
+            query,
+            self.execution_id,
+            self.plan.run_id,
+            "state_timeout",
+            attempts_started=1,
+        )
         with self.assertRaisesRegex(CCODExecutionError, "终止边界"):
             summarize_signal_gate(self.plan, self.identity, [base])
         base["state_budget_exhausted"] = True
+        _rehash_result_row(base)
         summary = summarize_signal_gate(self.plan, self.identity, [base])
         self.assertEqual(summary["execution_status"], "incomplete")
 
@@ -729,6 +788,7 @@ class SignalGateTest(unittest.TestCase):
                 if key != "result_hash"
             }
         )
+        _rehash_result_row(row)
         with self.assertRaisesRegex(CCODExecutionError, "字段集合"):
             summarize_signal_gate(self.plan, self.identity, [row])
 
@@ -744,6 +804,7 @@ class SignalGateTest(unittest.TestCase):
                 if key != "result_hash"
             }
         )
+        _rehash_result_row(second[0])
         self.assertNotEqual(
             scientific_results_hash(self.plan, self.identity, first),
             scientific_results_hash(self.plan, self.identity, second),

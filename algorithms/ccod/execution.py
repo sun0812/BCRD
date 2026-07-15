@@ -24,6 +24,7 @@ from schedulers.state_replay import sha256_json
 EXECUTION_IDENTITY_SCHEMA_VERSION = "eosbench-ccod-execution-identity-v1"
 SIGNAL_GATE_SUMMARY_SCHEMA_VERSION = "eosbench-ccod-signal-gate-summary-v1"
 SCIENTIFIC_LABELS_SCHEMA_VERSION = "eosbench-ccod-scientific-labels-v1"
+QUERY_RESULT_SCHEMA_VERSION = "eosbench-ccod-query-result-v1"
 
 FROZEN_STATE_COUNT = 100
 FROZEN_QUERY_COUNT = 1570
@@ -95,6 +96,40 @@ _COUNTERFACTUAL_RESULT_FIELDS = frozenset(
         "objective_hash",
         "problem_runtime_fingerprint",
         "result_hash",
+    }
+)
+_SUCCESS_QUERY_RESULT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "execution_id",
+        "run_id",
+        "query_ordinal",
+        "state_ordinal",
+        "action_ordinal",
+        "state_hash",
+        "query_key",
+        "status",
+        "cache_hit_at_invocation_start",
+        "result",
+        "row_hash",
+    }
+)
+_FAILED_QUERY_RESULT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "execution_id",
+        "run_id",
+        "query_ordinal",
+        "state_ordinal",
+        "action_ordinal",
+        "state_hash",
+        "query_key",
+        "status",
+        "failure_kind",
+        "attempts_started",
+        "attempt_budget",
+        "state_budget_exhausted",
+        "row_hash",
     }
 )
 
@@ -646,9 +681,31 @@ def _index_query_results(
             raise ExecutionIdentityError(
                 f"query result[{result_index}] 的 execution_id 冲突"
             )
-        if "run_id" in result_row and result_row.get("run_id") != plan.run_id:
+        status = result_row.get("status")
+        expected_fields = (
+            _SUCCESS_QUERY_RESULT_FIELDS
+            if status == "success"
+            else _FAILED_QUERY_RESULT_FIELDS
+            if status == "failed"
+            else None
+        )
+        if expected_fields is None:
+            raise CCODExecutionError("query result status 只允许 success/failed")
+        if set(result_row) != expected_fields:
+            raise CCODExecutionError("query result 字段集合与 status 不一致")
+        if result_row.get("schema_version") != QUERY_RESULT_SCHEMA_VERSION:
+            raise ExecutionIdentityError("query result schema_version 冲突")
+        if result_row.get("run_id") != plan.run_id:
             raise ExecutionIdentityError(
                 f"query result[{result_index}] 的 run_id 冲突"
+            )
+        stored_row_hash = result_row.get("row_hash")
+        unhashed_row = {
+            key: value for key, value in result_row.items() if key != "row_hash"
+        }
+        if stored_row_hash != sha256_json(unhashed_row):
+            raise ExecutionIdentityError(
+                f"query result[{result_index}] 的 row_hash 不一致"
             )
         query_key = str(result_row.get("query_key", ""))
         planned = planned_by_key.get(query_key)
@@ -658,11 +715,16 @@ def _index_query_results(
             raise CCODExecutionError("query results 含重复 query_key")
         if (
             result_row.get("query_ordinal") != planned.get("query_ordinal")
+            or result_row.get("state_ordinal") != planned.get("state_ordinal")
+            or result_row.get("action_ordinal") != planned.get("action_ordinal")
             or result_row.get("state_hash") != planned.get("state_hash")
         ):
             raise CCODExecutionError("query result 的 ordinal/state 引用不一致")
-        status = result_row.get("status")
         if status == "success":
+            if not isinstance(
+                result_row.get("cache_hit_at_invocation_start"), bool
+            ):
+                raise CCODExecutionError("success query 的 cache hit 标志非法")
             q_value, result_hash = _validated_result_q_value(
                 planned,
                 result_row,
@@ -701,8 +763,6 @@ def _index_query_results(
                     "可恢复 failed query 尚未达到 attempt 或 state 终止边界"
                 )
             q_value, result_hash = None, None
-        else:
-            raise CCODExecutionError("query result status 只允许 success/failed")
         indexed[query_key] = (result_row, q_value, result_hash)
     return expected_execution_id, indexed
 
