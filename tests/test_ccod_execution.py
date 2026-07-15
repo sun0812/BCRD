@@ -463,6 +463,9 @@ class SignalGateTest(unittest.TestCase):
         )
         self.assertFalse(failed["overall"]["fraction_passed"])
         self.assertFalse(failed["passed"])
+        self.assertEqual(failed["execution_status"], "complete")
+        self.assertEqual(failed["signal_gate"], "fail")
+        self.assertEqual(failed["method_decision"], "no_go")
 
     def test_cities_08_boundary_is_24_of_47(self) -> None:
         passing = set(range(24)) | set(range(50, 85))
@@ -525,24 +528,46 @@ class SignalGateTest(unittest.TestCase):
         with self.assertRaisesRegex(ExecutionIdentityError, "冲突"):
             summarize_signal_gate(self.plan, self.identity, rows)
 
-    def test_terminal_timeout_failure_invalidates_the_run(self) -> None:
-        rows = self._results(range(100))
-        rows[0].pop("result")
-        rows[0]["status"] = "failed"
-        rows[0]["failure_kind"] = "query_timeout"
-        summary = summarize_signal_gate(self.plan, self.identity, rows)
-        self.assertEqual(summary["execution_status"], "invalid")
-        self.assertEqual(summary["signal_gate"], "not_evaluated")
-        self.assertIsNone(summary["method_decision"])
+    def test_recoverable_failures_keep_the_run_incomplete(self) -> None:
+        """资源与进程故障可恢复，不能冒充科学身份作废。"""
+        recoverable = (
+            "query_timeout",
+            "state_timeout",
+            "rss_exceeded",
+            "worker_exit",
+            "worker_error",
+            "attempt_exhausted",
+            "interrupted",
+        )
+        for failure_kind in recoverable:
+            with self.subTest(failure_kind=failure_kind):
+                rows = self._results(range(100))
+                rows[0].pop("result")
+                rows[0]["status"] = "failed"
+                rows[0]["failure_kind"] = failure_kind
+                summary = summarize_signal_gate(self.plan, self.identity, rows)
+                self.assertEqual(summary["execution_status"], "incomplete")
+                self.assertEqual(summary["signal_gate"], "not_evaluated")
+                self.assertIsNone(summary["method_decision"])
+                self.assertEqual(summary["failure_counts"], {failure_kind: 1})
 
     def test_identity_failure_is_invalid_and_unknown_failure_is_rejected(self) -> None:
-        rows = self._results(range(100))
-        rows[0].pop("result")
-        rows[0]["status"] = "failed"
-        rows[0]["failure_kind"] = "identity_mismatch"
-        summary = summarize_signal_gate(self.plan, self.identity, rows)
-        self.assertEqual(summary["execution_status"], "invalid")
-        self.assertEqual(summary["signal_gate"], "not_evaluated")
+        invalid_kinds = (
+            "identity_mismatch",
+            "cache_corrupt",
+            "hash_mismatch",
+            "frozen_drift",
+            "runner_drift",
+        )
+        for failure_kind in invalid_kinds:
+            with self.subTest(failure_kind=failure_kind):
+                rows = self._results(range(100))
+                rows[0].pop("result")
+                rows[0]["status"] = "failed"
+                rows[0]["failure_kind"] = failure_kind
+                summary = summarize_signal_gate(self.plan, self.identity, rows)
+                self.assertEqual(summary["execution_status"], "invalid")
+                self.assertEqual(summary["signal_gate"], "not_evaluated")
 
         rows[0]["failure_kind"] = "invented_failure"
         with self.assertRaisesRegex(CCODExecutionError, "failure_kind"):
@@ -632,11 +657,11 @@ class SignalGateTest(unittest.TestCase):
                 if key != "result_hash"
             }
         )
-        with self.assertRaisesRegex(CCODExecutionError, "final_score-base_score"):
+        with self.assertRaisesRegex(CCODExecutionError, "q_h 与目标差值"):
             summarize_signal_gate(self.plan, self.identity, [wrong_q])
 
-    def test_terminal_failure_is_invalid_but_missing_is_incomplete(self) -> None:
-        """可恢复缺失与两次尝试后的终态失败必须可审计地区分。"""
+    def test_recoverable_failure_and_missing_are_both_incomplete(self) -> None:
+        """可恢复失败与尚未运行都不得提前计算 signal gate。"""
         missing = summarize_signal_gate(self.plan, self.identity, [])
         self.assertEqual(missing["execution_status"], "incomplete")
         self.assertEqual(missing["failed_queries"], 0)
@@ -657,11 +682,42 @@ class SignalGateTest(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(failed["execution_status"], "invalid")
+        self.assertEqual(failed["execution_status"], "incomplete")
         self.assertEqual(failed["signal_gate"], "not_evaluated")
         self.assertIsNone(failed["passed"])
         self.assertEqual(failed["failed_queries"], 1)
         self.assertEqual(failed["failure_counts"], {"query_timeout": 1})
+
+    def test_nested_operational_metadata_is_rejected(self) -> None:
+        """运行元数据不得混入稳定 result_hash 并污染科学哈希。"""
+        row = self._single_success()
+        row["result"]["elapsed_s"] = 1.25
+        row["result"]["result_hash"] = sha256_json(
+            {
+                key: value
+                for key, value in row["result"].items()
+                if key != "result_hash"
+            }
+        )
+        with self.assertRaisesRegex(CCODExecutionError, "字段集合"):
+            summarize_signal_gate(self.plan, self.identity, [row])
+
+    def test_scientific_hash_binds_stable_result_hash(self) -> None:
+        """同一 Q_H 但不同稳定结果证据必须产生不同科学哈希。"""
+        first = self._results(range(59))
+        second = json.loads(json.dumps(first))
+        second[0]["result"]["final_schedule_hash"] = "sha256:" + "44" * 32
+        second[0]["result"]["result_hash"] = sha256_json(
+            {
+                key: value
+                for key, value in second[0]["result"].items()
+                if key != "result_hash"
+            }
+        )
+        self.assertNotEqual(
+            scientific_results_hash(self.plan, self.identity, first),
+            scientific_results_hash(self.plan, self.identity, second),
+        )
 
 
 if __name__ == "__main__":
