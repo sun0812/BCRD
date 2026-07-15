@@ -11,6 +11,7 @@ weighted scores for a schedule.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Dict, List
 
 from schedulers.scenario_loader import SchedulingProblem
@@ -57,7 +58,10 @@ class ObjectiveModel:
         self.weights = weights.normalized()
 
         self.total_tasks = max(1, len(problem.tasks))
-        self.total_priority = float(sum(float(t.priority) for t in problem.tasks.values()))
+        self.total_priority = math.fsum(
+            float(problem.tasks[task_id].priority)
+            for task_id in sorted(problem.tasks)
+        )
         if self.total_priority <= 0:
             self.total_priority = 1.0
 
@@ -69,14 +73,14 @@ class ObjectiveModel:
 
     def profit_score(self, schedule: Schedule) -> float:
         """Calculate the profit score."""
-        assigned = set(schedule.assigned_task_ids)
+        assigned = sorted(set(schedule.assigned_task_ids))
         if not assigned:
             return 0.0
-        s = 0.0
-        for tid in assigned:
-            t = self.problem.tasks.get(tid)
-            if t is not None:
-                s += float(t.priority)
+        s = math.fsum(
+            float(self.problem.tasks[task_id].priority)
+            for task_id in assigned
+            if task_id in self.problem.tasks
+        )
         return max(0.0, min(1.0, s / self.total_priority))
 
     def completion_score(self, schedule: Schedule) -> float:

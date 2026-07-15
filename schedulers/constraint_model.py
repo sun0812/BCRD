@@ -74,7 +74,9 @@ class Schedule:
 
     @property
     def assigned_task_ids(self) -> List[str]:
-        return list({a.task_id for a in self.assignments})
+        # A stable order matters for reproducible objective fingerprints and
+        # manifests across fresh processes with different PYTHONHASHSEED.
+        return sorted({a.task_id for a in self.assignments})
 
 
 # ==============================

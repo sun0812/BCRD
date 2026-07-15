@@ -3,7 +3,13 @@ from __future__ import annotations
 import unittest
 from typing import Any, Dict, Optional
 
-from scripts.batch_export_trajectories import parse_schedule_filename
+from scripts.batch_export_trajectories import (
+    TRAJECTORY_SCHEMA_VERSION,
+    _candidate_set_stats,
+    _objective_delta,
+    _require_objective_weights,
+    parse_schedule_filename,
+)
 from scripts.validate_trajectory_schema import ValidationStats, validate_row
 
 
@@ -31,6 +37,48 @@ class ImplicitObjectiveParsingTest(unittest.TestCase):
         )
         self.assertEqual(parsed["objective_weights"], [0.25, 0.25, 0.25, 0.25])
 
+    def test_unknown_implicit_mapping_fails_fast(self) -> None:
+        parsed = parse_schedule_filename(
+            "scheduler_Scenario_X_c1_unmapped_solver_implicit"
+        )
+        with self.assertRaisesRegex(ValueError, "all zero"):
+            _require_objective_weights(parsed, "unmapped.json")
+
+    def test_unparseable_filename_fails_fast(self) -> None:
+        parsed = parse_schedule_filename("not-a-scheduler-filename")
+        with self.assertRaisesRegex(ValueError, "cannot parse"):
+            _require_objective_weights(parsed, "not-a-scheduler-filename.json")
+
+    def test_explicit_all_zero_objective_fails_fast(self) -> None:
+        parsed = parse_schedule_filename(
+            "scheduler_Scenario_X_c3_sa_p0_c0_t0_b0"
+        )
+        with self.assertRaisesRegex(ValueError, "all zero"):
+            _require_objective_weights(parsed, "all-zero.json")
+
+
+class UnifiedObjectiveDeltaTest(unittest.TestCase):
+    def test_deltas_telescope_to_final_minus_initial_score(self) -> None:
+        scores = [0.1, 0.25, 0.25, 0.4, 0.35]
+        deltas = [
+            _objective_delta(before, after)
+            for before, after in zip(scores, scores[1:])
+        ]
+        self.assertAlmostEqual(sum(deltas), scores[-1] - scores[0])
+
+    def test_skip_is_the_same_transition_and_has_zero_delta(self) -> None:
+        before = 0.375
+        self.assertEqual(_objective_delta(before, before), 0.0)
+
+    def test_candidate_stats_describe_cap_before_feasibility(self) -> None:
+        self.assertEqual(
+            _candidate_set_stats(cap=16, enumerated=16, feasible=7),
+            {"cap": 16, "enumerated": 16, "feasible": 7, "cap_reached": True},
+        )
+        self.assertFalse(
+            _candidate_set_stats(cap=16, enumerated=8, feasible=3)["cap_reached"]
+        )
+
 
 class DynamicTrajectorySchemaTest(unittest.TestCase):
     @staticmethod
@@ -52,12 +100,16 @@ class DynamicTrajectorySchemaTest(unittest.TestCase):
             "candidate_keys": [{"is_skip": True}],
             "valid_mask": [1],
             "expert_action_index": 0,
-            "reward": -1.0,
-            "future_return_H": -1.0,
             "schedule_metrics": {},
         }
         if schema is not None:
             row["_schema"] = schema
+        if schema is not None and schema.get("version") == "eosbench-trajectory-v2":
+            row["objective_delta"] = 0.0
+            row["observed_return_H"] = 0.0
+        else:
+            row["reward"] = -1.0
+            row["future_return_H"] = -1.0
         return row
 
     def test_legacy_5_by_10_row_remains_compatible(self) -> None:
@@ -104,6 +156,71 @@ class DynamicTrajectorySchemaTest(unittest.TestCase):
         self.assertEqual(stats.cand_dim_source, "_schema")
         self.assertEqual(stats.expected_schema_version, "eosbench-trajectory-v1")
         self.assertEqual(stats.rows_failing_schema_consistency, 1)
+
+    def test_v2_uses_new_target_fields_without_legacy_reward_fields(self) -> None:
+        stats = ValidationStats()
+        schema = {
+            "version": TRAJECTORY_SCHEMA_VERSION,
+            "state_dim": 7,
+            "candidate_dim": 10,
+        }
+        row = self._row(7, 10, schema)
+
+        self.assertNotIn("reward", row)
+        self.assertNotIn("future_return_H", row)
+        validate_row(0, row, stats)
+
+        self.assertEqual(stats.rows_with_all_fields, 1)
+        self.assertEqual(stats.missing_field_counts, {})
+        self.assertEqual(stats.rows_failing_target_semantics, 0)
+
+    def test_v2_missing_observed_return_is_rejected_conditionally(self) -> None:
+        stats = ValidationStats()
+        row = self._row(
+            7,
+            10,
+            {
+                "version": TRAJECTORY_SCHEMA_VERSION,
+                "state_dim": 7,
+                "candidate_dim": 10,
+            },
+        )
+        del row["observed_return_H"]
+        validate_row(0, row, stats)
+
+        self.assertEqual(stats.rows_with_all_fields, 0)
+        self.assertEqual(stats.missing_field_counts["observed_return_H"], 1)
+        self.assertEqual(stats.missing_field_counts["future_return_H"], 0)
+
+    def test_v1_still_requires_legacy_target_fields(self) -> None:
+        stats = ValidationStats()
+        schema = {
+            "version": "eosbench-trajectory-v1",
+            "state_dim": 5,
+            "candidate_dim": 10,
+        }
+        row = self._row(5, 10, schema)
+        del row["future_return_H"]
+        validate_row(0, row, stats)
+
+        self.assertEqual(stats.missing_field_counts["future_return_H"], 1)
+        self.assertEqual(stats.missing_field_counts["observed_return_H"], 0)
+
+    def test_v2_skip_must_have_zero_objective_delta(self) -> None:
+        stats = ValidationStats()
+        row = self._row(
+            7,
+            10,
+            {
+                "version": TRAJECTORY_SCHEMA_VERSION,
+                "state_dim": 7,
+                "candidate_dim": 10,
+            },
+        )
+        row["objective_delta"] = -1.0
+        validate_row(0, row, stats)
+
+        self.assertEqual(stats.rows_failing_target_semantics, 1)
 
     def test_declared_dimension_must_match_row(self) -> None:
         stats = ValidationStats()

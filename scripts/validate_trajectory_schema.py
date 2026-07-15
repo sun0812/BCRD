@@ -7,7 +7,9 @@ scripts/validate_trajectory_schema.py
 输入：scripts/batch_export_trajectories.py 产出的 jsonl 文件。
 作用：在前 ``--max_rows`` 行（或 0 表示扫全文件）上验证以下内容：
 
-    - 所有必填的顶层字段是否齐全
+    - 所有必填的顶层字段是否齐全；legacy / v1 使用
+      ``reward + future_return_H``，v2 使用
+      ``objective_delta + observed_return_H``
     - ``state_features`` 和 ``candidate_features`` 的维度在整个文件中一致
       （优先读取可选 ``_schema``，否则从首个有效样本推断）
     - ``len(candidate_features) == len(candidate_keys) == len(valid_mask)``
@@ -29,8 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-# 每一行 jsonl 样本必须出现的顶层字段集合
-REQUIRED_FIELDS = [
+# 所有版本共享的顶层字段；目标字段按 schema 版本条件选择。
+COMMON_REQUIRED_FIELDS = [
     "scenario_id",
     "schedule_file",
     "solver_name",
@@ -43,10 +45,17 @@ REQUIRED_FIELDS = [
     "candidate_keys",
     "valid_mask",
     "expert_action_index",
-    "reward",
-    "future_return_H",
     "schedule_metrics",
 ]
+LEGACY_TARGET_FIELDS = ["reward", "future_return_H"]
+V2_TARGET_FIELDS = ["objective_delta", "observed_return_H"]
+
+# 保留该名称供外部 import；它表示无 ``_schema`` 的 legacy contract。
+REQUIRED_FIELDS = COMMON_REQUIRED_FIELDS + LEGACY_TARGET_FIELDS
+SUPPORTED_DECLARED_SCHEMA_VERSIONS = {
+    "eosbench-trajectory-v1",
+    "eosbench-trajectory-v2",
+}
 
 
 @dataclass
@@ -61,6 +70,7 @@ class ValidationStats:
     rows_failing_label_range: int = 0  # expert_action_index 越界的行数
     rows_failing_skip_convention: int = 0  # SKIP 约定不成立的行数
     rows_failing_schema_consistency: int = 0  # _schema 声明错误 / 版本或维度混用
+    rows_failing_target_semantics: int = 0  # v2 delta/return 类型或 SKIP delta 错误
     schema_error_rows: Set[int] = field(default_factory=set, repr=False)
     missing_field_counts: Counter = field(default_factory=Counter)
     rows_with_declared_schema: int = 0
@@ -102,6 +112,21 @@ def _positive_int(value: Any) -> Optional[int]:
     return value
 
 
+def _declared_schema_version(row: Dict[str, Any]) -> Optional[str]:
+    """Return a usable declared version; absent/malformed metadata is legacy-like."""
+    raw = row.get("_schema")
+    if not isinstance(raw, dict) or raw.get("version") is None:
+        return None
+    return str(raw["version"])
+
+
+def _required_fields_for_row(row: Dict[str, Any]) -> List[str]:
+    """Choose target fields without breaking existing schema-less/v1 files."""
+    version = _declared_schema_version(row)
+    targets = V2_TARGET_FIELDS if version == "eosbench-trajectory-v2" else LEGACY_TARGET_FIELDS
+    return COMMON_REQUIRED_FIELDS + targets
+
+
 def _read_declared_schema(
     idx: int,
     row: Dict[str, Any],
@@ -128,6 +153,11 @@ def _read_declared_schema(
             errors.append(f"row {idx}: _schema.version is required when _schema is present")
         else:
             version_text = str(version)
+            if version_text not in SUPPORTED_DECLARED_SCHEMA_VERSIONS:
+                errors.append(
+                    f"row {idx}: unsupported _schema.version={version_text!r}; "
+                    f"supported={sorted(SUPPORTED_DECLARED_SCHEMA_VERSIONS)!r}"
+                )
             if stats.expected_schema_version is None:
                 stats.expected_schema_version = version_text
             elif version_text != stats.expected_schema_version:
@@ -196,7 +226,8 @@ def validate_row(idx: int, row: Dict[str, Any], stats: ValidationStats) -> None:
     stats.rows_checked += 1
 
     # ---------- 1) 必填字段
-    missing = [k for k in REQUIRED_FIELDS if k not in row]
+    required_fields = _required_fields_for_row(row)
+    missing = [k for k in required_fields if k not in row]
     if missing:
         for k in missing:
             stats.missing_field_counts[k] += 1
@@ -313,6 +344,37 @@ def validate_row(idx: int, row: Dict[str, Any], stats: ValidationStats) -> None:
     else:
         stats.expert_at_positive_count += 1
 
+    # ---------- 8) v2 unified-objective target semantics
+    if _declared_schema_version(row) == "eosbench-trajectory-v2":
+        import math
+
+        delta = row["objective_delta"]
+        observed_return = row["observed_return_H"]
+        target_error = None
+        if (
+            isinstance(delta, bool)
+            or not isinstance(delta, (int, float))
+            or not math.isfinite(float(delta))
+        ):
+            target_error = f"row {idx}: objective_delta must be a finite number, got {delta!r}"
+        elif (
+            isinstance(observed_return, bool)
+            or not isinstance(observed_return, (int, float))
+            or not math.isfinite(float(observed_return))
+        ):
+            target_error = (
+                f"row {idx}: observed_return_H must be a finite number, "
+                f"got {observed_return!r}"
+            )
+        elif label == 0 and abs(float(delta)) > 1e-12:
+            target_error = (
+                f"row {idx}: SKIP objective_delta={delta!r}, expected 0 from F(after)-F(before)"
+            )
+
+        if target_error is not None:
+            stats.rows_failing_target_semantics += 1
+            stats.note_error(target_error)
+
 
 def write_report(report_path: Path, stats: ValidationStats, input_path: Path, max_rows: int) -> None:
     """根据累计的 stats 渲染一份 Markdown 报告。"""
@@ -342,7 +404,12 @@ def write_report(report_path: Path, stats: ValidationStats, input_path: Path, ma
 
     lines.append("## 2. Required-field coverage")
     lines.append("")
-    lines.append(f"- rows with all {len(REQUIRED_FIELDS)} required fields : **{stats.rows_with_all_fields} / {n}**")
+    lines.append(
+        f"- rows with all version-conditional required fields : "
+        f"**{stats.rows_with_all_fields} / {n}**"
+    )
+    lines.append("- legacy / v1 targets: `reward`, `future_return_H`")
+    lines.append("- v2 targets: `objective_delta`, `observed_return_H`")
     if stats.missing_field_counts:
         lines.append("- missing-field histogram:")
         for k, v in stats.missing_field_counts.most_common():
@@ -368,6 +435,7 @@ def write_report(report_path: Path, stats: ValidationStats, input_path: Path, ma
     lines.append(f"- rows failing schema/version consistency                     : **{stats.rows_failing_schema_consistency}**")
     lines.append(f"- rows failing `len(cands)==len(keys)==len(mask)`             : **{stats.rows_failing_length_consistency}**")
     lines.append(f"- rows failing `0 <= expert_action_index < num_candidates`    : **{stats.rows_failing_label_range}**")
+    lines.append(f"- rows failing v2 unified-objective target semantics          : **{stats.rows_failing_target_semantics}**")
     lines.append("")
 
     lines.append("## 4. SKIP convention")
@@ -420,6 +488,7 @@ def write_report(report_path: Path, stats: ValidationStats, input_path: Path, ma
         + stats.rows_failing_length_consistency
         + stats.rows_failing_label_range
         + stats.rows_failing_skip_convention
+        + stats.rows_failing_target_semantics
         + sum(stats.missing_field_counts.values())
     )
     lines.append("## 8. Verdict")
@@ -435,10 +504,25 @@ def write_report(report_path: Path, stats: ValidationStats, input_path: Path, ma
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--max_rows", type=int, default=100, help="0 表示扫全文件")
-    parser.add_argument("--report", type=Path, default=Path("docs/trajectory_schema_validation_report.md"))
+    parser = argparse.ArgumentParser(
+        description=(
+            "Stream-validate legacy/v1 reward trajectories or v2 unified "
+            "objective_delta trajectories without loading the JSONL into memory."
+        )
+    )
+    parser.add_argument("--input", type=Path, required=True, help="Trajectory JSONL to validate")
+    parser.add_argument(
+        "--max_rows",
+        type=int,
+        default=100,
+        help="Rows to scan; 0 validates the complete file (default: 100)",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        default=Path("docs/trajectory_schema_validation_report.md"),
+        help="Markdown validation report path",
+    )
     args = parser.parse_args()
 
     if not args.input.exists():

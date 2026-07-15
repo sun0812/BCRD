@@ -2,12 +2,12 @@
 """
 scripts/batch_export_trajectories.py
 
-Batch exporter for BCRD imitation-learning trajectories.
+Batch exporter for EOS-Bench constructive imitation-learning trajectories.
 
 For every scheduler_*.json found under --schedule_dir, this script replays
 the schedule against the given Scenario JSON using EOS-Bench's own
 candidate_pool + constraint_model, and writes one (state, candidate set,
-expert action, reward, future_return_H) sample per scheduling step.
+expert action, objective_delta, observed_return_H) sample per scheduling step.
 
 Decision protocol (documented for downstream training):
 
@@ -42,10 +42,15 @@ Decision protocol (documented for downstream training):
       partial schedule (a known mismatch case for MIP / SA / GA / ACO),
       the label also collapses to SKIP and we count it in the stats.
 
-    - Reward uses the same convention as RLSchedulingEnv:
-        * apply assignment -> reward = reward_scale * Δ ObjectiveModel.score
-        * skip / infeasible -> reward = -unassigned_penalty (no scale)
-      Defaults: reward_scale = 10.0, unassigned_penalty = 1.0.
+    - Every observed action, including SKIP, uses one objective convention:
+      ``objective_delta = ObjectiveModel.score(after) -
+      ObjectiveModel.score(before)``.  SKIP leaves the schedule unchanged, so
+      its immediate delta is naturally zero.  No procedural reward scaling or
+      unassigned-task penalty is mixed into this target.
+
+    - ``observed_return_H`` is the sum of observed ``objective_delta`` values
+      over ``[t, t + H)``.  It describes the replayed trace only; it is not a
+      candidate-specific counterfactual target.
 
 Outputs:
 
@@ -105,7 +110,7 @@ _OBJ_RE = re.compile(
 
 # Class-2 heuristic schedules encode their objective in the algorithm name and
 # therefore use the literal ``implicit`` objective tag in the filename.  Keep
-# this mapping next to the filename parser so replay rewards use the intended
+# this mapping next to the filename parser so replay objective deltas use the intended
 # metric instead of passing all-zero weights to ObjectiveWeights.normalized(),
 # whose documented fallback is profit-only.
 _IMPLICIT_OBJECTIVE_WEIGHTS: Dict[str, Tuple[float, float, float, float]] = {
@@ -259,7 +264,7 @@ def match_assignment_to_window(
 # =============================================================================
 
 
-TRAJECTORY_SCHEMA_VERSION = "eosbench-trajectory-v1"
+TRAJECTORY_SCHEMA_VERSION = "eosbench-trajectory-v2"
 
 
 CAND_FEAT_NAMES = (
@@ -395,8 +400,6 @@ def _candidate_key(cand: Optional[Assignment]) -> Dict[str, Any]:
 class ReplayConfig:
     horizon: int = 10
     max_candidates: int = 8192
-    reward_scale: float = 10.0
-    unassigned_penalty: float = 1.0
     placement_mode: str = "earliest"
     downlink_duration_ratio: float = 1.0
     agility_profile: str = "Standard-Agility"
@@ -440,6 +443,51 @@ class ScheduleStats:
         return good / float(denom)
 
 
+def _require_objective_weights(parsed: Dict[str, Any], source: str) -> ObjectiveWeights:
+    """Return validated objective weights or fail before replay starts.
+
+    ``ObjectiveWeights.normalized`` deliberately falls back to profit-only for
+    a zero vector.  That fallback is useful at the generic objective layer but
+    is unsafe for trajectory export: an unparsed filename would silently label
+    data with the wrong objective.  Export therefore requires a parsed,
+    finite, non-negative, non-zero four-vector.
+    """
+    import math
+
+    raw = parsed.get("objective_weights")
+    if parsed.get("class_id", -1) < 0 or parsed.get("objective_tag") == "unknown":
+        raise ValueError(
+            f"cannot parse solver/objective metadata from schedule filename: {source}"
+        )
+    if not isinstance(raw, list) or len(raw) != 4:
+        raise ValueError(f"invalid objective weight vector for {source}: {raw!r}")
+    weights = [float(value) for value in raw]
+    if any(not math.isfinite(value) or value < 0.0 for value in weights):
+        raise ValueError(f"objective weights must be finite and non-negative for {source}: {raw!r}")
+    if sum(weights) <= 0.0:
+        raise ValueError(
+            f"objective weights are all zero for {source}; refusing implicit profit fallback"
+        )
+    return ObjectiveWeights(*weights)
+
+
+def _objective_delta(before_score: float, after_score: float) -> float:
+    """Unified immediate target used by both assignment and SKIP actions."""
+    return float(after_score) - float(before_score)
+
+
+def _candidate_set_stats(cap: int, enumerated: int, feasible: int) -> Dict[str, Any]:
+    """Describe the exporter's cap-before-feasibility candidate protocol."""
+    return {
+        "cap": int(cap),
+        "enumerated": int(enumerated),
+        "feasible": int(feasible),
+        # Equality cannot prove truncation, hence the deliberately conservative
+        # name ``cap_reached`` rather than ``truncated``.
+        "cap_reached": bool(int(enumerated) >= int(cap)),
+    }
+
+
 def replay_schedule(
     problem: SchedulingProblem,
     schedule_path: Path,
@@ -453,13 +501,12 @@ def replay_schedule(
 
     stem = schedule_path.stem
     parsed = parse_schedule_filename(stem)
-    weights = ObjectiveWeights(*parsed["objective_weights"])
+    weights = _require_objective_weights(parsed, schedule_path.name)
     obj_model = ObjectiveModel(problem, weights)
 
     cm = ConstraintModel(
         problem=problem,
         placement_mode=cfg.placement_mode,
-        unassigned_penalty=1000.0,  # only used by ConstraintModel.evaluate; not by us
         downlink_duration_ratio=cfg.downlink_duration_ratio,
         agility_profile=cfg.agility_profile,
         non_agile_transition_s=cfg.non_agile_transition_s,
@@ -537,6 +584,11 @@ def replay_schedule(
         )
 
         feasible: List[Assignment] = [c for c in cand_assigns if cm.is_feasible_assignment(c, schedule)]
+        candidate_set_stats = _candidate_set_stats(
+            cap=cfg.max_candidates,
+            enumerated=len(cand_assigns),
+            feasible=len(feasible),
+        )
         enumerated_keys = {
             (int(c.sat_window_id or 0), c.sat_start_time) for c in cand_assigns
         }
@@ -603,13 +655,12 @@ def replay_schedule(
             if cm.is_feasible_assignment(chosen, schedule):
                 schedule.assignments.append(chosen)
 
-        # ----- Step 2e: reward
-        if chosen is None:
-            reward = -float(cfg.unassigned_penalty)
-        else:
-            new_score = float(obj_model.score(schedule))
-            reward = float(cfg.reward_scale) * (new_score - prev_score)
-            prev_score = new_score
+        # ----- Step 2e: one objective semantics for every observed action.
+        # SKIP follows exactly the same score-after minus score-before path;
+        # because it does not mutate ``schedule``, its delta is naturally 0.
+        new_score = float(obj_model.score(schedule))
+        objective_delta = _objective_delta(prev_score, new_score)
+        prev_score = new_score
 
         cand_counts.append(len(action_set))
 
@@ -644,10 +695,11 @@ def replay_schedule(
             "candidate_features": cand_feats,
             "candidate_keys": cand_keys,
             "valid_mask": valid_mask,
+            "candidate_set_stats": candidate_set_stats,
             "expert_action_index": int(step_stats.expert_action_index),
-            "reward": float(reward),
-            # future_return_H is filled in a second pass once all rewards are known
-            "future_return_H": None,
+            "objective_delta": float(objective_delta),
+            # Filled in a second pass once all observed deltas are known.
+            "observed_return_H": None,
             "schedule_metrics": schedule_metrics,
             "_debug": {
                 "expert_skipped_by_json": step_stats.expert_skipped_by_json,
@@ -658,11 +710,11 @@ def replay_schedule(
             },
         })
 
-    # ----- Step 3: roll up future_return_H = sum of rewards over [t, t+H)
+    # ----- Step 3: observed_return_H = sum objective_delta over [t, t+H)
     H = int(cfg.horizon)
-    rewards = [s["reward"] for s in samples]
+    objective_deltas = [s["objective_delta"] for s in samples]
     for i in range(len(samples)):
-        samples[i]["future_return_H"] = float(sum(rewards[i:i + H]))
+        samples[i]["observed_return_H"] = float(sum(objective_deltas[i:i + H]))
 
     elapsed = time.time() - t0
     if verbose:
@@ -711,13 +763,29 @@ def write_jsonl(path: Path, samples: List[Dict[str, Any]]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Batch export BCRD imitation-learning trajectories from EOS-Bench scenarios and schedules.",
+        description=(
+            "Export eosbench-trajectory-v2 constructive traces with unified "
+            "ObjectiveModel deltas (SKIP delta = 0)."
+        ),
     )
     parser.add_argument("--scenario", required=True, type=Path, help="Path to Scenario_*.json")
     parser.add_argument("--schedule_dir", required=True, type=Path, help="Directory containing scheduler_*.json files")
     parser.add_argument("--out_dir", required=True, type=Path, help="Output directory for jsonl + merged jsonl")
-    parser.add_argument("--horizon", type=int, default=10, help="Horizon H for future_return_H (default: 10)")
-    parser.add_argument("--max_candidates", type=int, default=8192, help="Candidate budget per task (default: 8192; large enough to cover all windows of every task in S1; lower if memory bound).")
+    parser.add_argument(
+        "--horizon",
+        type=int,
+        default=10,
+        help="Horizon H for observed_return_H=sum objective_delta[t:t+H] (default: 10)",
+    )
+    parser.add_argument(
+        "--max_candidates",
+        type=int,
+        default=8192,
+        help=(
+            "Enumeration cap applied before feasibility filtering (default: 8192); "
+            "each row records cap/enumerated/feasible/cap_reached."
+        ),
+    )
     parser.add_argument(
         "--replay_order",
         choices=["priority_desc", "sat_start_asc"],
@@ -743,6 +811,11 @@ def main() -> int:
     report_path: Path = args.report or (REPO_ROOT / "docs" / "batch_trajectory_export_report.md")
     verbose: bool = not args.quiet
 
+    if horizon <= 0:
+        parser.error("--horizon must be a positive integer")
+    if max_candidates <= 0:
+        parser.error("--max_candidates must be a positive integer")
+
     if not scenario_path.exists():
         print(f"[fatal] Scenario JSON not found: {scenario_path}", file=sys.stderr)
         return 2
@@ -760,6 +833,18 @@ def main() -> int:
     if not schedule_paths:
         print(f"[fatal] No scheduler_*.json files found under {schedule_dir}", file=sys.stderr)
         return 2
+
+    # Validate the complete batch before opening the merged output.  A typo in
+    # a late filename must not leave a seemingly valid but partial v2 export.
+    for schedule_path in schedule_paths:
+        try:
+            _require_objective_weights(
+                parse_schedule_filename(schedule_path.stem),
+                schedule_path.name,
+            )
+        except (TypeError, ValueError) as exc:
+            print(f"[fatal] {exc}", file=sys.stderr)
+            return 2
 
     print(f"[info] Loading scenario: {scenario_path}", flush=True)
     problem = load_scheduling_problem_from_json(scenario_path)
@@ -858,8 +943,12 @@ def write_report(
     lines.append("# Batch Trajectory Export Report")
     lines.append("")
     lines.append("> Generated by `scripts/batch_export_trajectories.py`.")
-    lines.append("> Replay protocol: priority-desc (matches `RLSchedulingEnv` and BCRD future inference).")
+    lines.append(
+        f"> Replay protocol: `{cfg.replay_order}` "
+        "(`priority_desc` matches the constructive inference order)."
+    )
     lines.append("> Candidate seeding: `_stable_seed(scenario_id, schedule_stem, task_id)` for reproducibility.")
+    lines.append(f"> Schema: `{TRAJECTORY_SCHEMA_VERSION}`; labels use unscaled `ObjectiveModel.score` deltas.")
     lines.append("")
     lines.append("## 1. Run parameters")
     lines.append("")
@@ -869,8 +958,9 @@ def write_report(
     lines.append(f"out_dir            : {out_dir}")
     lines.append(f"horizon (H)        : {cfg.horizon}")
     lines.append(f"max_candidates     : {cfg.max_candidates}")
-    lines.append(f"reward_scale       : {cfg.reward_scale}")
-    lines.append(f"unassigned_penalty : {cfg.unassigned_penalty}")
+    lines.append("target             : objective_delta = F(after) - F(before)")
+    lines.append("skip_delta         : 0 (schedule unchanged)")
+    lines.append("return             : observed_return_H = sum objective_delta[t:t+H]")
     lines.append(f"placement_mode     : {cfg.placement_mode}")
     lines.append(f"downlink_ratio     : {cfg.downlink_duration_ratio}")
     lines.append(f"agility_profile    : {cfg.agility_profile}")
@@ -963,6 +1053,9 @@ def write_report(
     lines.append("")
     lines.append("- `match_rate` = fraction of `assignments` whose `(sat,sensor,orbit,sat_start_time)` resolved to a unique scenario window.")
     lines.append("- `found_rate` = fraction of replay steps whose label is *not* `skip-by-infeasibility-mismatch` or `skip-by-window-missing`. Steps labeled SKIP because the JSON listed the task as unassigned are *counted as valid* (the expert correctly chose to skip).")
+    lines.append("- `objective_delta` always uses the report objective `F`; no PPO reward scale or procedural unassigned penalty is included.")
+    lines.append("- `observed_return_H` is an observed-trace sum, not a candidate-specific counterfactual target.")
+    lines.append("- `candidate_set_stats` records the cap-before-feasibility protocol: `cap`, cap-limited `enumerated`, `feasible`, and `cap_reached`.")
     lines.append("- For solvers without a strict task-by-task semantics (SA / GA / ACO / MIP under priority-desc replay), some steps may collapse to SKIP due to ordering mismatch; this is documented in `eosbench_interface_report.md` §8.3.")
     lines.append("")
 
