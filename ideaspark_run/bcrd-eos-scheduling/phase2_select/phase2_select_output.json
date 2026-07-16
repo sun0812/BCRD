@@ -1,0 +1,51 @@
+{
+  "selected_gaps": [
+    {
+      "gap": "No retrieved frontier leaf makes heterogeneous downstream opportunity costs among currently feasible but unselected assignments learnable when evaluating all alternatives is computationally prohibitive.",
+      "chosen_pattern_id": "architectural_operator_substitution",
+      "anchor_alternates": [
+        "self_supervised_signal_engineering",
+        "decompose_and_delegate"
+      ],
+      "companion_pattern": null,
+      "companion_rationale": "",
+      "selection_rationale": "This is the bottleneck's load-bearing construction gap because without candidate-specific downstream-damage supervision, a learned scheduler cannot distinguish harmless from irreversible feasible deviations at the required action-set scale. architectural_operator_substitution replaces exhaustive per-alternative continuation evaluation with a cheaper surrogate constrained to preserve opportunity-cost ordering, while explicitly avoiding regression to AggreVaTe-style oracle enumeration, Q-learning coverage, or online tree search."
+    },
+    {
+      "gap": "No retrieved frontier leaf establishes when a bounded amount of alternative-action evidence preserves the ordering of low- versus high-damage scheduling choices as feasible-set size and conflict intensity grow.",
+      "chosen_pattern_id": "controlled_diagnostic_design",
+      "anchor_alternates": [],
+      "companion_pattern": null,
+      "companion_rationale": "",
+      "selection_rationale": "Under the shared_object thread, this gap stress-tests the same opportunity-cost ordering that the anchor surrogate must learn, rather than introducing a second target. controlled_diagnostic_design varies feasible-set size and conflict intensity while holding schedule state and evidence budget controlled, so rank preservation is measured against tractable exhaustive references rather than confounded by instance difficulty."
+    },
+    {
+      "gap": "No retrieved paper tests whether the learning signal must be attached only to the single action executed at each partial-schedule state.",
+      "chosen_pattern_id": "assumption_audit_and_pivot",
+      "anchor_alternates": [],
+      "companion_pattern": "controlled_diagnostic_design",
+      "companion_rationale": "assumption_audit_and_pivot exposes and overturns the executed-action-only assumption but does not by itself ship the required empirical separation; controlled_diagnostic_design owns the matched-state test of whether multi-action evidence changes downstream scheduling quality.",
+      "selection_rationale": "Under the shared_object thread, this gap asks whether the same candidate-level opportunity-cost ordering may supervise multiple feasible actions at one partial schedule instead of only the executed action. assumption_audit_and_pivot directly challenges that load-bearing attachment assumption and pivots to alternative-action evidence, with the companion supplying the empirical diagnostic needed to establish the effect."
+    }
+  ],
+  "coherence_thread_type": "shared_object",
+  "deliverable_coverage": "method — anchor gap → architectural_operator_substitution yields the runnable bounded-cost surrogate that replaces exhaustive alternative evaluation while preserving candidate opportunity-cost ordering.",
+  "pattern_saturation": {
+    "architectural_operator_substitution": {
+      "share": 0.0,
+      "saturation_band": "untested",
+      "selection_note": "untested lane — differentiation_from_lit must substantively defend the choice"
+    },
+    "controlled_diagnostic_design": {
+      "share": 0.1,
+      "saturation_band": "untested",
+      "selection_note": "untested lane — differentiation_from_lit must substantively defend the choice"
+    },
+    "assumption_audit_and_pivot": {
+      "share": 0.0,
+      "saturation_band": "untested",
+      "selection_note": "untested lane — differentiation_from_lit must substantively defend the choice"
+    }
+  },
+  "deferred_gaps": []
+}

@@ -1,0 +1,396 @@
+                                           An energy-efficient learning solution for the Agile
+                                            Earth Observation Satellite Scheduling Problem
+                                             Antonio M. Mercado-Martı́nez, Beatriz Soret Senior Member, IEEE, Antonio Jurado-Navas Member, IEEE
+
+
+                                            Abstract—The Agile Earth Observation Satellite Scheduling                  [2]. Likewise, the presence of turbulence in the atmosphere
+                                         Problem (AEOSSP) entails finding the subset of observation                    causes aberrations in the image during its capture [3], which
+                                         targets to be scheduled along the satellite’s orbit while meet-               also results in its exclusion. Finally, image resolution must be
+                                         ing operational constraints of time, energy and memory. The
+                                         problem of deciding what and when to observe is inherently                    also considered as some applications require high-resolution
+                                         complex, and becomes even more challenging when considering                   images to perform properly. This is defined by the ground
+
+
+
+
+arXiv:2503.04803v2 [cs.RO] 12 Jun 2025
+                                         several issues that compromise the quality of the captured                    sample distance (GSD), i.e., the real distance represented by
+                                         images, such as cloud occlusion, atmospheric turbulence, and                  a pixel in the image, which increases as the target moves
+                                         image resolution. This paper presents a Deep Reinforcement                    away from the nadir. The smaller the GSD, the higher the
+                                         Learning (DRL) approach for addressing the AEOSSP with time-
+                                         dependent profits, integrating these three factors to optimize                image quality [4]. Nevertheless, the scope of AEOS allows
+                                         the use of energy and memory resources. The proposed method                   us to integrate these factors into the AEOSSP, improving the
+                                         involves a dual decision-making process: selecting the sequence of            performance and the obtained observation profit.
+                                         targets and determining the optimal observation time for each.                   In this paper, we investigate a Deep Reinforcement Learn-
+                                         Our results demonstrate that the proposed algorithm reduces                   ing (DRL) [5] approach for solving the AEOSSP with time-
+                                         the capture of images that fail to meet quality requirements
+                                         by > 60% and consequently decreases energy waste from                         dependent profits for a single AEOS taking into account the
+                                         attitude maneuvers by up to 78%, all while maintaining strong                 presence of clouds and atmospheric turbulence, as well as
+                                         observation performance.                                                      image resolution, in order to achieve both good energy and
+                                                                                                                       memory resources management. This involves a dual decision-
+                                                                  I. I NTRODUCTION
+                                                                                                                       making process, as it requires selecting both the sequence of
+                                         One of the most relevant advances in the realm of Earth                       targets and the best observation time for each. To address it,
+                                         Observation (EO) has been the introduction of Agile Earth                     we model the problem as a graph and leverage the use of
+                                         Observation Satellites (AEOS) [1]. Unlike Conventional Earth                  Graph Neural Networks (GNN).
+                                         Observation Satellites (CEOS), which can only adjust their                       The rest of the paper is organized as follows. Section
+                                         attitude along the roll axis, AEOS have a strong attitude                     II provides an overview of related works. In Section III,
+                                         adjustment capability along three axes (roll, pitch, and yaw).                we introduce the system model. The optimization problem
+                                         This allows AEOS to have longer Visible Time Windows                          is described in Section IV, while the proposed algorithm
+                                         (VTW), enabling multiple Observation Time Windows (OTW)                       is presented in Section V. The conducted experiments and
+                                         for a single target. The VTW represents the time interval in                  the obtained results are discussed in Section VI, whereas
+                                         which a concrete observation target can be observed, while                    Section VII concludes the paper.
+                                         the OTW represents its real observation time. Although this
+                                                                                                                                           II. S TATE OF THE A RT
+                                         provides a wide range of options, it also complicates the
+                                         selection of the OTW when multiple observation targets are                    The AEOSSP has been widely studied in recent years. Exist-
+                                         involved in the same observation period, which is known                       ing approaches can be classified into exact methods, heuristics,
+                                         as the Agile Earth Observation Satellite Scheduling Problem                   metaheuristics, and machine learning. Among machine learn-
+                                         (AEOSSP). In particular, the AEOSSP consists of maximizing                    ing methods, some studies have employed DRL, such as in the
+                                         the total observation profit while satisfying all temporal,                   case of [6], where GNN were applied with promising results.
+                                         energy, and memory constraints. Such observation profit can                   This approach is particularly well suited to the problem, as
+                                         be defined in different ways depending on the nature of the                   it can be effectively modeled as a graph, a quite common
+                                         application.                                                                  practice in the field [7].
+                                            However, this process is not always straightforward, as var-                  Cloud coverage remains a significant challenge within the
+                                         ious factors impact the quality and, consequently, the usability              scope of AEOSSP [7]. Various studies have addressed this
+                                         of the collected images. For example, a substantial number of                 issue, such as [2], where a re-scheduling algorithm based
+                                         collected EO images are discarded because of cloud occlusion                  on cloud coverage forecasting was developed. On the other
+                                                                                                                       hand, the presence of atmospheric turbulence has not been as
+                                            This work is funded by the Spanish Ministerio de Ciencia, Innovación      extensively explored in the AEOSSP context. However, [8]
+                                         y Universidades (project ”TATOOINE”, grant no. PID2022-136269OB-I00).         evaluates its impact on EO images and concludes that it is an
+                                         The author thankfully acknowledges the computer resources, technical exper-
+                                         tise and assistance provided by the SCBI (Supercomputing and Bioinformat-     important factor to consider.
+                                         ics) center of the University of Malaga.                                         Finally, image resolution is another critical aspect affecting
+                                                                      and is assigned a binary variable indicating the presence or
+                                                                      absence of clouds in that area. Pclouds denotes the percentage
+                                                                      of cells representing the presence of clouds within the grid.
+                                                                      Cells representing cloud presence are grouped into clusters of
+                                                                      adjacent cells, with each cluster emulating an individual cloud.
+                                                                      δi,n represents the fraction of the target’s surface covered by
+                                                                      clouds when capturing target i at ti,n .
+                                                                         Atmospheric turbulence is determined by the refractive
+                                                                      index structure parameter Cn2 , which is a statistical measure of
+                                                                      the strength of the turbulence in the atmosphere, and, similarly
+                                                                      to clouds, it is modeled as a grid deployed at altitude hCn2
+                                                                      above the observation area. Each cell in the grid represents
+                                                                      a square area of size lCn2 centered at a specific coordinate,
+Fig. 1: Scenario with a single AEOS, multiple observation
+                                                                      and is assigned a Cn2 value. PCn,max
+                                                                                                         2     denotes the percentage
+targets and the presence of clouds and atmospheric turbulence.                           2                      2
+                                                                      of cells with a Cn value greater than Cn,max     in the grid, with
+                                                                        2
+the quality of EO images. This factor was taken into account          Cn,max    being the maximum allowed Cn2 for obtaining a high-
+in [9], where an exact method for solving the AEOSSP with             quality image. Since the channel characteristics determining
+time-dependent profits was developed. There, the observation          Cn2 values vary by position and are independent, the value of
+profit was formulated as a function of image resolution. Sim-         each cell is uncorrelated with the others. Cn2 (i, n) represents
+ilar to our approach, this study incorporates a dual decision-        the Cn2 value affecting the image quality when capturing target
+making process that involves selecting the sequence of targets        i at ti,n .
+and determining the observation time for each.                           Both, Cn2 (i, n) and δi,n values determine whether meteo-
+                                                                      rological conditions for observing target i at ti,n are suitable
+                     III. S YSTEM M ODEL
+                                                                      for capturing the image. This suitability is represented by the
+Fig. 1 shows the considered scenario consisting of an AEOS            following binary function:
+that observes a set of N ground observation targets along its                                            
+orbit. The satellite operates at an altitude hsat in an orbit with                                       1,
+                                                                                                             Cn2 (i, n) ≤ Cn2 max
+an inclination ζ, observing a set of targets T distributed within           fi,n (Cn2 (i, n), δi,n ) =        and δi,n < δmax ,      (3)
+an observation area. Each target i represents a squared area                                             
+                                                                                                           0, otherwise
+                                                                                                         
+of size ltarget , which can be observed at ti,n .
+   The attitude of the satellite during observation at ti,n is
+defined by the roll (θi,n ), pitch (ϕi,n ), and yaw (ψi,n ) angles.   where δmax is the maximum permissible fraction of
+The satellite’s attitude maneuver capability is determined by         the target’s surface that can be covered by clouds. If
+its maximum roll, pitch, and yaw angles (θmax , ϕmax , and            fi,n (Cn2 (i, n), δi,n ) = 1, the conditions are deemed suitable;
+ψmax , respectively) as well as the attitude transition time.         otherwise, fi,n (Cn2 (i, n), δi,n ) = 0.
+These factors dictate which targets can be observed and                  The AEOSSP to be formulated in this scenario is a dual
+scheduled at any given time. The attitude transition time is          decision-making problem involving the selection of the se-
+described by a piecewise linear function that depends on the          quence of targets and determining the capture time for each.
+speed of the camera and the angular difference between two            To address this, the system is modeled as a directed graph
+consecutive observations [10]. Specifically, for the scenario         G = (V, E), where V represents the set of nodes in the
+where target i is observed at ti,n and target j is observed at        graph and E denotes the set of edges connecting them. Each
+tj,m , the attitude transition time is defined as follows:            node vi,n denotes a feasible pair observation target i at a
+                                                                     capture time n, referred to as an action; and the edges ei,n−j,m
+                
+                
+                 11.66,                  αi,n−j,m ≤ 10◦              connect nodes that can be scheduled in the same sequence
+                5 + αi,n−j,m /1.5,       10◦ < αi,n−j,m ≤ 30◦        while meeting the constraints. The graph also includes a node
+                
+                
+                
+∆ti,n−j,m = 10 + αi,n−j,m /2,             30◦ < αi,n−j,m ≤ 60◦ ,      representing the last action taken, as well as a virtual node at
+                                                                      the beginning of the observation which connects to all other
+                  16 + αi,n−j,m /2.5, 60◦ < αi,n−j,m ≤ 90◦
+                
+                
+                
+                                                                      nodes.
+                
+                
+                                          αi,n−j,m > 90◦
+                
+                22 + α
+                         i,n−j,m /3,
+                                                                         The information gathered at each node vi,n in the graph
+                                                                (1)
+                                                                      includes: the GSD of target i at ti,n ; fi,n (Cn2 (i, n), δi,n ),
+  αi,n−j,m = |θi,n − θj,m | + |ϕi,n − ϕj,m | + |ψi,n − ψj,m |, (2)
+                                                                      representing the suitability of meteorological conditions
+where αi,n−j,m is the total attitude transition angle between         when capturing target i at ti,n ; and the capture time
+target i observed at ti,n and target j observed at tj,m .             ti,n . Thus, we form the node features vector ⃗vi,n =
+   Clouds are modeled as a grid deployed at altitude hclouds          (GSDi,n , fi,n (Cn2 (i, n), δi,n ), ti,n ). It is assumed that this
+above the observation area. Each cell in the grid represents a        information is available and can be processed to create the
+square area of size lclouds centered at a specific coordinate,        graph.
+IV. AGILE E ARTH O BSERVATION S ATELLITE S CHEDULING
+                        P ROBLEM
+The AEOSSP consists of maximizing the total observation
+profit while meeting temporal, energy, and memory opera-
+tional constraints. For the sake of simplicity, we have only
+considered time constraints. Interestingly, this results in sig-
+nificant energy and memory savings, as an optimal resolution
+of the AEOSSP leads to a better resource management, as
+later shown in the results. The mathematical formulation is as
+follows:            X
+             max        ρi,n xi ,                           (4a)       Fig. 2: Variation of GSD with respect to the off-nadir angle,
+                      i∈T                                              assuming a GSD of 0.5 m/pixel at nadir.
+               s.t.   swi ≤ ti,n ≤ ewi − di ,                  (4b)
+                      ti,n + di + ∆ti,n−j,m ≤ tj,m ,           (4c)
+                      xi ∈ {0, 1}, xi ≤ 1,                     (4d)
+
+where ρi,n is the observation profit for target i at ti,n ; xi
+a binary decision variable for target i, xi = 1, denotes that
+target i is scheduled to be observed, otherwise xi = 0; swi
+and ewi the start and observation time of the VTW for target
+i; di the duration of the OTW for target i; and ∆ti,n−j,m the                            Fig. 3: GNN architecture.
+attitude transition time between target i observed at ti,n and
+target j observed at tj,m . Equation (4a) is the optimization          graph has only the last taken action, meaning that there are
+objective function, which is to maximize the sum of collected          no more feasible actions.
+profits; Equation (4b) represents the VTW constraint, which               Thus, we define a Markov decision process (MDP)
+ensures that the observation of target i occurs within its VTW;        ⟨S, A, T, R⟩, where: S is the state set represented by the
+Equation (4c) represents the attitude transition constraint,           graph; A the set of possible actions represented by the nodes
+which guarantees that observing target j at tj,m is feasible           in the graph; T the state transition function, which corresponds
+after observing target i at ti,n ; Equation (4d) represents the        to the graph update based on the last selected action; and R the
+value of the decision variable and the fact that a target can          reward function, which corresponds to the observation profit
+exist at most once in a single scheduling.                             when it is greater than zero, otherwise, it will correspond to
+   The observation profit ρi,n ranges from 0 to 1, where               a penalty.
+1 indicates that the conditions at ti,n allow us to achieve               The decisions that compose the final sequence of actions are
+the highest possible image quality, and 0 denotes that the             made by a neural network. We make use of Graph Attention
+conditions are not appropriate for capturing the image at ti,n .       Networks (GAT) [11], a GNN structure that introduces the
+We formulate it as:                                                    mechanism of attention to capture the most relevant charac-
+                     GSDnadir                                          teristics of the graph. GATs are able to weight the relationships
+             ρi,n =             fi,n (Cn2 (i, n), δi,n ),    (5)
+                      GSDi,n                                           between the nodes of the graph based both on the features of
+where GSDnadir and GSDi,n are the GSD at nadir and for                 the nodes and the edge structure.
+target i at ti,n , respectively. As mentioned previously, the GSD         Similar to [6], we propose a model with two single-layer
+increases as the target moves away from the nadir reaching             GATs as embedding layers. We transfer the normalized fea-
+its minimum at the nadir itself (see Fig. 2), i.e, the minimum         tures vector of each node vi,n along with the edges structure
+GSD for each target is obtained in the middle of its VTW.              E in these layers obtaining the node embeddings. These
+Thus, the first term of the observation profit refers to image         embeddings, which contain meaningful information based on
+resolution. A small GSD value leads to a better resolution. The        both node features and edge structure, are then passed through
+second term, fi,n (Cn2 (i, n), δi,n ), represents the suitability of   a fully connected layer that outputs a one-dimensional value
+meteorological conditions.                                             representing the quality of a particular action. The proposed
+                                                                       network architecture is shown in Fig. 3.
+                         V. A LGORITHM                                    The parameters of the neural network are obtained by
+The solution of the AEOSSP can be considered a sequential              learning from batches of training data following a deep Q-
+decision process in which the next action is selected based on         learning (DQN) approach. In Q-learning, an agent aims to find
+the current graph, representing the state. Once the decision is        the optimal policy that maximizes the long-term cumulative
+made, the graph is updated so it includes only the last selected       reward. For this, a state-action value Qt is defined to describe
+pair observation target i at a capture time n and the ones that        the expected reward rt of taking action at under state st
+are still feasible. This process is repeated until the resulting       at time t so that the agent can learn the optimal policy.
+               TABLE I: Simulation parameters.
+Parameter                     Value
+                                                                      Algorithm 1 DQN algorithm training
+di                            0.15 s                                   1: Input: Set of training episodes E, ϵ0 , ϵdecay , ϵmin , γ,
+ltarget                       5 km                                          training batch size batchsize
+δmax                          0.25
+GSDnadir                      0.5 m/pixel                              2: Output: Network parameters
+Cn2
+     max                      5 × 10−15 m−2/3                          3: Initialize ϵ = ϵ0 , memory ← ∅ and DQN
+θmax , ϕmax , ψmax            45◦ , 45◦ , 90◦                          4: for e in E do
+hsat                          600 km
+ζ                             98.6◦                                    5:    Set initial Graph G for episode e, st = G
+hclouds                       10 km                                    6:    Get initial set of possible actions At
+lclouds                       2 km                                     7:   done = F alse
+Pclouds                       {0.4, 0.6}
+hC 2                          20 km                                    8:   while not done do
+    n
+lC 2                          10 km                                    9:      if random(0,1) > ϵ then
+   n
+PC 2
+    n
+                              {0.2, 0.4}                              10:         Sample random action at form At
+VTW duration                  [18 - 185] s                            11:      else
+Average observation period    {1623.79, 977.95} s                     12:         Sample action at from At according to
+N                             {40, 60, 80, 100}
+                                                                                  DQN(st , a)
+                                                                      13:      end if
+Mathematically, this is expressed as:                                 14:      Get reward rt = R(st , at )
+                                                                      15:      Update graph G, st+1 = G and set of actions At
+        Qt (st , at ) = (1 − lr)Qt (st , at )                         16:      if At is empty then
+                                                       
+                        + lr rt + γ max Qt+1 (st+1 , a) ,      (6)    17:         done = T rue
+                                         a
+                                                                      18:      end if
+where γ is the discount factor that adjust the importance of          19:      Store {st , at , rt , st+1 , done} in memory
+future rewards over time and lr the learning rate. At each            20:      Update state st = st+1
+time step the agent takes an action at , observes the reward          21:      if length(memory) ≥ batchsize then
+rt , and the state is updated to st+1 depending on st and             22:         Sample random training batch from memory
+at until the episode is over. An episode is defined as a              23:         for {st , at , rt , st+1 , done} in batch do
+complete sequence of interactions between the agent and the           24:            Qt = DQN(st , at )
+environment, starting from an initial state and ending when           25:            if not done then
+a specific termination condition is reached. The Q-table is           26:               Qmax
+                                                                                          t+1 = arg max(DQN(st+1 , a))
+updated with every time step t. In a DQN framework, a deep            27:               target = r + γ · Qmax  t+1
+neural network is employed to estimate the state-action value         28:            else
+Qt . In our context, the agent is the AEOS; the state st the          29:               target = r
+current graph at time t; the action at the scheduled target           30:            end if
+based on st ; rt the observation profit if it is greater than zero,   31:            Loss(Qt , target)
+otherwise it corresponds to a penalty; the next state st+1 is the     32:            Update DQN using SGD
+updated graph after selecting the action; the beginning of an         33:         end for
+episode corresponds to the initial graph with the virtual node        34:      end if
+and its termination condition is the exhaustion of the set of         35:   end while
+possible actions. We follow an ϵ-greedy policy: an exploration        36:   if ϵ > ϵmin then
+rate ϵ is defined, so that the agent choose a random action with      37:      ϵ = ϵ · ϵdecay
+a probability ϵ and the one that maximizes the expected reward        38:   end if
+with a probability 1 − ϵ. We define an initial exploration rate       39: end for
+ϵ0 that decays by a factor ϵdecay with each episode until a
+minimum exploration rate ϵmin is reached in order to favor                            TABLE II: Learning parameters.
+exploration during the initial episodes. We use mean square
+error function to calculate the loss and the network parameters       Parameter                     Value
+are updated according to stochastic gradient descent (SGD).           ϵ0                            1
+                                                                      ϵdecay                        0.999
+The training process is shown in Algorithm 1.                         ϵmin                          0.01
+                             VI. R ESULTS                             γ                             0.999
+                                                                      Learning rate                 5 × 10−5
+In order to simplify the problem, we make some assumptions.           batchsize                     64
+We assume that all the targets in the set have the same size,         Number of training episodes   5000
+that can be captured in a single shot, and that the duration of
+the observation is the same for each target. We also set only
+three possible observation times for each target when using           the proposed model: at the beginning, in the middle, and at
+the end of its VTW; and an initial satellite attitude of θ0 = 0◦ ,
+ϕ0 = 0◦ , ψ0 = 0◦ . The simulation parameters are shown in
+Table I, while Table II displays the learning parameters. Code
+execution and training use an Nvidia A100 GPU with 1 TB
+of RAM. The algorithm and the simulator are implemented
+in Python and PyTorch 2.2.0 is used as learning framework.
+   The performance of the algorithm will be compared with
+two baselines: (1) MaxResolution, in which the observation
+time of each target is set to the middle of its VTW, i.e., when
+we get the best possible resolution for the image. The schedul-
+ing is decided according to this parameter and meteorological
+                                                                                Fig. 4: Average loss per training batch.
+conditions are not taken into account; (2) MaxTargets, in
+which we aim to capture as many observation targets as
+possible. These are arranged in ascending order according
+to their VTW and those that are feasible are captured at
+their earliest observation start time [12]. Image resolution and
+meteorological conditions are not taken into account.
+   To evaluate the performance of both the proposed model
+and the baselines, four metrics will be used: the total obser-
+vation profit obtained at the end of the episode, as described in
+Section IV, the precision, the percentage of discarded images,
+and the energy waste due to attitude maneuvers. We define the
+precision as follows:
+                                                                     Fig. 5: Observation profit and precision for different graph
+                                 N′                                  sizes (N = 40, 60, 80, 100) and trained model.
+                      Precision = sch ,                       (7)
+                                 Nsch                                B. Model Performance
+being Nsch the total number of targets in the final scheduling          We consider four different cases to test the performance of
+       ′
+and Nsch   the number of targets in the final scheduling whose       the proposed model and the baselines: (1) instances generated
+observation profit is greater than zero. A higher precision          under the same conditions as the training instances; (2) the
+value leads to a more efficient management of memory and             average observation period is reduced while maintaining the
+energy resources, as it reduces both the number of discarded         number of targets per instance, so that the decision-making
+images and the corresponding attitude maneuvers required to          process becomes more critical; (3) more severe meteorological
+capture them. The energy consumption is quantified in units          conditions are considered, i.e., higher Pclouds and PCn2 values;
+of energy per unit of attitude transition time [1], so we can        (4) a combination of (2) and (3), representing the most
+calculate the energy waste due to these actions.                     challenging case. Like in the model comparison, tests consist
+                                                                     of 200 instances.
+A. Training
+                                                                        Fig. 6a shows the results for the case (1). The observation
+   First, we train the neural network with instances of targets      profit obtained by the model only surpass the MaxTargets
+randomly generated of four different instance sizes: N = 40,         baseline in the 100-target instance and ranges from 78%
+60, 80 and 100 targets. Thus, we obtain four different models        to 99% of the baseline values in all other cases, but the
+depending on the size of the training instances. We consider         precision values are significantly improved, increasing from
+an average observation period, i.e., the period in which the         approximately 52% to 85%. This results in a significantly
+VTW of the targets are distributed, of 1623.79 seconds, and          more efficient memory utilization, as the number of discarded
+clouds and atmospheric turbulence are randomly distributed           images due to cloud coverage or atmospheric turbulence
+above the observation area according to Pclouds = 0.4 and            decreases by 68.75%, and a reduction of a 65% and 75%
+PCn2 = 0.2 for each instance. Fig. 4 shows the average loss per      of energy waste from attitude maneuvers with respect to
+training batch for the case of the training with instances of 40     the MaxResolution and MaxTargets baselines is achieved,
+targets, where a rapid decay and convergence can be observed.        respectively.
+We also test the four trained models against instances of               For case (2), we consider an average observation period
+size N = 40, 60, 80 and 100 targets and generated in the             of 977.95 seconds. The results are displayed in Fig. 6b. In
+same conditions as the training (200 instances each). Results        this case, the observation profit obtained by the predicted
+are displayed in Fig. 5. Although precision does not vary            scheduling outperforms the one obtained for the baselines
+significantly, the model trained with instances of 40 targets        except for the 80- and 100-target instances for the MaxReso-
+gets the highest observation profit in all cases. Therefore, this    lution baseline. Furthermore the number of discarded images
+model will be the one used in the following evaluations.             is reduced by 67.65% and the energy waste by 57% and 69%
+Fig. 6: Observation profit and precision. (a) Average observation period = 1623.79 seconds, Pclouds = 0.4, and PCn2 = 0.2.
+(b) Average observation period = 977.95 seconds, Pclouds = 0.4, and PCn2 = 0.2. (c) Average observation period = 1623.79
+seconds, Pclouds = 0.6, and PCn2 = 0.4. (d) Average observation period = 977.95 seconds, Pclouds = 0.6, and PCn2 = 0.4.
+
+with respect to the MaxResolution and MaxTargets baselines,         the current state that is dynamically updated according to
+respectively.                                                       the last action and propose a neural network trained in a
+   Fig. 6c illustrates the results for case (3). We consider        DQN framework that leverages the potential of the GAT to
+Pclouds = 0.6 and PCn2 = 0.4. Similarly to the previous case,       decide the best next possible action. The results show that the
+the observation profit obtained by the model is greater than the    proposed model reduces the number of discarded images by
+one obtained by the baselines, except in the 40-target instance     > 60% and energy waste from attitude maneuvers by up to
+for the MaxTargets baseline. We also achieve a reduction            78%. Furthermore, it outperforms the baselines considered in
+of 64.2% in the number of discarded images and 66% and              challenging cases in terms of observation profit.
+78% of wasted energy with respect to the MaxResolution and            Future work will do the integration into the operation of an
+MaxTargets baselines, respectively.                                 EO satellite network with a joint optimization of the image
+   Finally, in case (4) we consider an average observation          acquisition process, data processing and communication, en-
+period of 977.95 seconds, Pclouds = 0.6, and PCn2 = 0.4. Fig.       abling more efficient use of the resources of the satellite and
+6d shows the results. The proposed model achieves a higher          the overall system. For this, we will consider a multi-satellite
+observation profit in all cases and reduces the number of           scenario and extend the formulation of the observation profit.
+discarded images by 61.4% and the wasted energy by 55% and
+by 69% with respect to the MaxResolution and MaxTargets                                         R EFERENCES
+baselines, respectively.
+                                                                     [1] X. Wang, G. Wu, L. Xing, and W. Pedrycz, “Agile Earth
+   Thus, we can conclude that the proposed model presents a              Observation Satellite Scheduling Over 20 Years: Formulations,
+good management of memory and energy resources. Further-                 Methods, and Future Directions,” IEEE Systems Journal,
+more, it has a great scalability capacity, since good results are        vol. 15, no. 3, p. 3881–3892, Sep. 2021. [Online]. Available:
+                                                                         http://dx.doi.org/10.1109/JSYST.2020.2997050
+obtained in instances of very different sizes, and outperforms       [2] G. Yi, C. Han, Y. Chen, and W. Xing, “Mission Re-planning For
+the considered baselines in complex cases, highlighting the              Multiple Agile Earth Observation Satellites based on Cloud Coverage
+importance of an accurate decision making process.                       Forecasting,” IEEE Journal of Selected Topics in Applied Earth Obser-
+                                                                         vations and Remote Sensing, vol. PP, pp. 1–1, 12 2021.
+                     VII. C ONCLUSIONS                               [3] L. C. Andrews and R. L. Phillips, “Laser beam propagation through
+                                                                         random media,” Laser Beam Propagation Through Random Media:
+We propose a DRL approach for the AEOSSP with time-                      Second Edition, 2005.
+dependent profits considering the impact of the cloud occlu-         [4] W. Yi et al., “Comprehensive Evaluation of the GF-4 Satellite
+                                                                         Image Quality from 2015 to 2020,” ISPRS International Journal
+sion, atmospheric turbulence and image resolution in order to            of Geo-Information, vol. 10, no. 6, 2021. [Online]. Available:
+improve the management of the energy and memory resources.               https://www.mdpi.com/2220-9964/10/6/406
+We model the AEOSSP as a directed graph representing                 [5] R. S. Sutton and A. G. Barto, Reinforcement Learning: An
+     Introduction, 2nd ed. The MIT Press, 2018. [Online]. Available:
+     http://incompleteideas.net/book/the-book-2nd.html
+ [6] J. Chun, W. Yang, X. Liu, G. Wu, L. He, and L. Xing, “Deep
+     Reinforcement Learning for the Agile Earth Observation Satellite
+     Scheduling Problem,” Mathematics, vol. 11, no. 19, 2023. [Online].
+     Available: https://www.mdpi.com/2227-7390/11/19/4059
+ [7] H. Chen, S. Peng, C. Du, and J. Li, Earth observation satellites : task
+     planning and scheduling, 1st ed. Singapore: Springer Nature Singapore,
+     2023.
+ [8] B. Soret et al., “Semantic and goal-oriented edge computing
+     for satellite Earth Observation,” 2024. [Online]. Available:
+     https://arxiv.org/abs/2408.15639
+ [9] G. Peng, R. Dewil, C. Verbeeck, A. Gunawan, L. Xing, and P. Vansteen-
+     wegen, “Agile earth observation satellite scheduling: An orienteering
+     problem with time-dependent profits and travel times,” Computers &
+     Operations Research, vol. 111, pp. 84–98, 2019. [Online]. Available:
+     https://www.sciencedirect.com/science/article/pii/S0305054819301510
+[10] X. Liu, G. Laporte, Y. Chen, and R. He, “An adaptive large
+     neighborhood search metaheuristic for agile satellite scheduling
+     with time-dependent transition time,” Computers & Operations
+     Research, vol. 86, pp. 41–53, 2017. [Online]. Available:
+     https://www.sciencedirect.com/science/article/pii/S0305054817300977
+[11] P. Veličković, G. Cucurull, A. Casanova, A. Romero, P. Liò, and
+     Y. Bengio, “Graph Attention Networks,” 2018. [Online]. Available:
+     https://arxiv.org/abs/1710.10903
+[12] C. Pralet and G. Verfaillie, “Time–dependent Simple Temporal Net-
+     works: Properties and Algorithms,” RAIRO - Operations Research,
+     vol. 47, no. 2, p. 173–198, 2013.
+

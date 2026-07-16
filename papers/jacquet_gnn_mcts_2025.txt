@@ -1,0 +1,643 @@
+                                                                 Improved Earth Observation Satellite Scheduling
+                                                            with Graph Neural Networks and Monte Carlo Tree Search
+                                                                   Antoine Jacquet1 , Guillaume Infantes1 , Emmanuel Benazera1 ,
+                                                                              Vincent Baudoui2 , Jonathan Guerra2 ,
+                                                                                        Stéphanie Roussel3
+                                                                           1
+                                                                          Jolibrain, Toulouse, France {firstname.lastname}@jolibrain.com
+                                                                   2
+                                                                    Airbus Defence & Space, Toulouse, France {firstname.lastname}@airbus.com
+                                                                  3
+                                                                    DTIS, ONERA, Université de Toulouse, France {firstname.lastname}@onera.fr
+                                                                       Abstract                               lecting a set of acquisitions that maximize their weighted cu-
+
+
+
+
+arXiv:2408.15041v2 [cs.AI] 26 Nov 2025
+                                           Earth Observation Satellite Planning (EOSP) is a difficult op-
+                                                                                                              mulative values and designing a schedule for acquiring these
+                                           timization problem with considerable practical interest. A set     observations while respecting the operational constraints.
+                                           of requested observations must be scheduled on an agile Earth         The most complex instances of the EOSP involve sev-
+                                           observation satellite while respecting constraints on their vis-   eral satellites orbiting the Earth over multiple orbits, and
+                                           ibility window, as well as maneuver constraints that impose        dependencies between targets (Wang et al. 2021). For in-
+                                           varying delays between successive observations. In addition,       stance, an acquisition may consist of several pictures of the
+                                           the problem is largely oversubscribed: there are much more         same earth-bound location to be taken by different satel-
+                                           candidate observations than can possibly be achieved. There-
+                                                                                                              lites, and/or in different time-windows (Squillaci, Pralet, and
+                                           fore, one must select the set of observations that will be per-
+                                           formed while maximizing their cumulative benefit and pro-          Roussel 2023b). In this paper, we limit our study to single-
+                                           pose a feasible schedule for these observations. As previous       satellite, single-orbit, and single-shot problems, where there
+                                           work mostly focused on heuristic and iterative search algo-        is only one satellite to control over a single orbit, and each
+                                           rithms, this paper presents a new technique for selecting and      acquisition is made of a single picture to be taken in its given
+                                           scheduling observations based on Graph Neural Networks             VTW. Nevertheless, the problem is NP-complete (Lemaı̂tre
+                                           (GNNs) and Deep Reinforcement Learning (DRL). GNNs are             et al. 2002), and there is no practical solution to compute
+                                           used to extract relevant information from the graphs repre-        optimal schedules for problems of realistic size which con-
+                                           senting instances of the EOSP, and DRL drives the search           tain a few thousand candidate acquisitions, thus focusing
+                                           for optimal schedules. A post-learning search step based on        previous work towards approximate, heuristic and random
+                                           Monte Carlo Tree Search (MCTS) is added that is able to
+                                                                                                              search algorithms (Wang et al. 2021). Variants of the greedy
+                                           find even better solutions. Experiments show that it is able to
+                                           learn on small problem instances and generalize to larger real-    randomized adaptive search procedure (GRASP) (Feo and
+                                           world instances, with very competitive performance com-            Resende 1995) are commonly deployed in practical appli-
+                                           pared to traditional approaches.                                   cations. In (Pralet 2023), the author considers a single satel-
+                                                                                                              lite scheduling problem with time-dependent maneuvers and
+                                                                                                              aims at minimizing the tardiness associated with a set of
+                                                              1     Introduction                              observations that must be performed. The solving approach
+                                         An Earth observation satellite (EOS) must acquire pho-               combines Dynamic Programming and Large Neighborhood
+                                         tographs of various locations on the surface of Earth to sat-        Search techniques. The problem we consider here is dif-
+                                         isfy user requests. An agile EOS has degrees of freedom al-          ferent as decisions must not only be made on the observa-
+                                         lowing it to target locations that are not exactly at its vertical   tions scheduling order but also on their presence in the final
+                                         in an earth-bound referential (“nadir”). The satellite we con-       scheduling.
+                                         sider is in low orbit; as a consequence, each observation is            At the same time, the field of combinatorial optimiza-
+                                         available in a visibility time window (VTW) that is signifi-         tion is currently the subject of an accrued interest from
+                                         cantly larger than its acquisition duration. Maneuvering the         researchers in deep learning. In particular, Deep Rein-
+                                         satellite between two observations consists of modifying its         forcement Learning (DRL) offers a framework for learn-
+                                         pitch, yaw and roll angles triple—also called its attitude—          ing heuristics for NP-complete problems that has been suc-
+                                         and thus implies delays that depend on the start and end ob-         cessfully applied to a wide range of problems (Yang et al.
+                                         servation targets as well as on the maneuver start date (Squil-      2022). Following this trend, we build on previous work us-
+                                         laci, Pralet, and Roussel 2023a). In addition, an agile EOS          ing a state-of-the-art combination of graph neural networks
+                                         is typically oversubscribed: there are more observations to          (GNN) and DRL. This approach code-named Wheatley was
+                                         be performed that can possibly be achieved in the given op-          developed to address Job Shop Scheduling Problems with
+                                         eration temporal horizon. As different acquisitions may be           duration uncertainty (Infantes et al. 2024). Here we adapt it
+                                         associated with different priorities or utilities, the Earth ob-     to the EOSP and prove its efficiency in solving deterministic
+                                         servation satellite planning problem (EOSP) consists in se-          but largely over-subscribed problems. Our simulation results
+                                         CC BY-NC-ND 4.0                                                      show that we outperform the currently deployed techniques.
+   Our main contributions are as follows: (1) propose a graph                   3     Problem Representation
+search representation of the problem without time discretiza-
+                                                                   An instance of the EOSP is defined by a set of candidate
+tion; (2) use deep reinforcement learning to solve the prob-
+                                                                   observations O, or acquisition requests, and a time-horizon
+lem; (3) use directly the problem graph representation as
+                                                                   τ (in this work, the duration of an orbit). Each observation
+observations within the graph neural network; (4) develop
+                                                                   i ∈ O is associated with its fixed duration di and its VTW
+a post-training search phase based on MCTS that substan-
+                                                                   [ei ; li ] such that li ≤ τ .
+tially improves the results. The main outcomes are: (1) very
+competitive results compared to baselines; (2) good gener-             The transition duration between two acquisitions i and j
+alization abilities allowing to train on small instances and       is a function ∆i,j (ti ) of the starting time ti of the first ob-
+solve efficiently large instances.                                 servation 1 . A schedule σ is a sequence of selected obser-
+                                                                   vations with associated starting time. It is represented by a
+   The paper is organized as follows. First, we give a quick       single mapping that associates with each candidate observa-
+survey of related work based on deep learning approaches           tion i ∈ O its starting time tσi , such that tσi = −1 for all
+to solve the EOSP. Then, in Section 3, we introduce the            observations i not selected in schedule σ. When there is no
+problem and discuss various representations used in this           ambiguity on the schedule σ considered, we write ti instead
+work. Section 4 is dedicated to the description of the ma-         of tσi . A schedule σ is feasible if: (i) each scheduled obser-
+chine learning architecture used for optimization and post-        vation starts and ends within its VTW: ∀i ∈ O such that
+training search. We provide simulation results on large size       ti ̸= −1, ti ∈ Wi where Wi = [ei ; li − di ]; (ii) the time gap
+real-world instances of the problem in Section 5. We finally       between two successive selected observations is greater or
+conclude and discuss further research directions.                  equal to the transition delay: ∀i, j ∈ O2 such that ti ̸= −1,
+                                                                   tj ̸= −1 and ti ≤ tj , tj − ti ≥ di + ∆i,j (ti ).
+                                                                       Each observation is associated with a utility value ui in
+                    2   Related Work                               R+ . The goal is then to find a feasible schedule that maxi-
+                                                                   mizes the cumulative
+                                                                                  P           utility
+                                                                                                   of the observations it includes:
+                                                                   maximize           i:ti ̸=−1 ui .
+The EOSP has been subject to a large body of research,
+from communities as varied as aerospace and engineer-
+ing, operational research, computer science, remote sens-          3.1    Classical Approach : Time Discretization
+ing and multidisciplinary sciences. We refer the reader to         In the EOSP, the start time ti of each observation has a con-
+(Wang et al. 2021) for a survey of non-machine learning            tinuous domain (Wi ), and the transition durations ∆i,j (ti )
+approaches to the problem, and we focus our attention on           are continuous functions of continuous variables. Therefore,
+DRL based approaches to the EOSP. Note that we address             the EOSP is not a pure discrete problem. However, it is of-
+the time-dependent EOSP, where the duration of a transition        ten re-framed as such, either by making assumptions on the
+between two observations varies with time. This contrasts          start time of transitions (for instance, every transition starts
+with most of previous literature that assumes constant, time-      as soon as possible), or by crudely discretizing the time vari-
+independent transition duration.                                   able domains.
+   Peng et al. (Peng et al. 2018) address a slightly differ-
+ent problem where observations are scheduled on board. A           Discrete graph. In this work, the problem input is pro-
+LSTM-based encoding network is used to extract features,           vided under the form a very large time-discretized graph,
+and a classification network is used to make a decision.           later called the “discrete graph”, and denoted G D . More pre-
+Dalin et al. (Dalin et al. 2021) solve multi-satellite instances   cisely, each visibility window Wi associated with observa-
+by modeling them as a Multi-Agent Markov Decision Pro-             tion i is discretized into a set of candidate starting dates de-
+cesses, then use a DRL actor-critic architecture. The actor is     noted WiD . In graph G D , every candidate acquisition i is
+decentralized, each satellite using a relatively shallow net-      represented card (WiD ) times. Formally, for each observa-
+work to select its action. The critic is centralized and im-       tion i and each possible discretized starting time ti ∈ WiD ,
+plemented as a large recurrent network taking input from           G D contains a node (i, ti ) representing the fact that obser-
+all satellites. Hermann et al. (Herrmann and Schaub 2023)          vation i start date is equal to ti . An arc between two nodes
+also address the multi-satellite problem: a policy is trained      associated with observations i and j is present if the end
+in a single satellite environment on a fixed number of imag-       observation j is a possible immediate successor of the start
+ing targets, and then deployed in a multi-satellite scenario       observation i. The acquisition and transition durations are
+where each spacecraft has its own list of imaging targets. Lo-     accounted for while defining the arcs: an arc between (i, ti )
+cal policies are learned using a combination of Monte Carlo        and (j, tj ) is such that tj is the smallest discrete time in WjD
+Tree Search (MCTS) to produce trajectories, and supervised         satisfying ti + di + ∆ij (ti ) ≤ tj . Note that there is an (im-
+learning to learn Q-values using the trajectories produced by      plicit) mutual exclusion between two nodes (i, ti ) and (i, t′i ),
+MCTS as training examples. Finally, Chun et al. (Chun et al.       ti ̸= t′i , to indicate that observation i must not be performed
+2023) present a very similar approach; the main difference
+is that the transition durations are approximated during the          1
+                                                                       Strictly speaking, the function depends on the starting time of
+training phase, whereas in our approach they are precisely         the maneuver, which is equal to ti + di , where di is a deterministic
+computed based on discrete date values before training.            duration.
+                                                                       directly from the discrete graph representation:
+                                                                        • A state s ∈ S is a discrete EOSP graph as defined be-
+                                                                          fore along with a schedule σ. It can be either the initial
+                                                                          discrete graph for which the schedule is empty, or an up-
+                                                                          dated graph along with a non-empty schedule;
+                                                                        • Given a state s and its associated schedule σ, the set of
+                                                                          available actions a is the set of all possible successors of
+                                                                          the last node in σ;
+                                                                        • MDPs naturally handle uncertainty in the problem. In the
+                                                                          general case, it is represented in the transition matrix:
+                                                                          T (s, a, s′ ) = Pr(s(t + 1) = s′ | s(t) = s, a(t) = a).
+                                                                          However, our formulation of the EOSP is deterministic,
+Figure 1: Discrete graph for 4 candidate acquisitions. Corre-             therefore the MDP contains no uncertainty 2 . Given an
+sponding continuous graph is a 4-node clique.                             initial state s (discrete graph with schedule) and a se-
+                                                                          lected action a (the next observation to add to the sched-
+                                                                          ule), the transition matrix gives probability 1 to the state
+twice. A virtual source node (0, t0 ) is added to represent the           s′ representing the discrete graph after the addition of
+temporal horizon starting date.                                           a to the schedule, following the update procedure de-
+   Finally, some arcs are pruned using considerations of op-              scribed previously.
+timality: if an observation k can be inserted between (i, ti )
+and (j, tj ) without breaking the constraints of the problem            • As every inserted observation is feasible by definition,
+(that is, the transition delays), then the arc between (i, ti )           we use as an immediate reward the utility value associ-
+and (j, tj ) is removed. In this case, every path between the             ated with the selected observation i.e. R(s, a, s′ ) = ua .
+two nodes must go through one node (k, tk ). The reasoning                The aim is to maximize the undiscounted sum of imme-
+is that every optimal solution that includes both (i, ti ) and            diate rewards.
+(j, tj ) would also include observation k. Therefore, (j, tj )            These components define a fully observable MDP on
+should not be an immediate successor of (i, ti ). Figure 1             which RL approaches can be based: the agent learns how
+provides an example of a discrete graph for a problem con-             to choose the next action in each state (policy) and the en-
+taining 4 candidate acquisitions.                                      vironment (or simulator) is responsible for providing a re-
+                                                                       ward associated with each selected action and updating the
+Schedule and graph update. With such a discrete graph,                 state accordingly. Although convenient for state-space ap-
+a schedule can be represented as path starting from the                proaches, the discrete graph has the drawback of quickly be-
+source node. Formally, a schedule is a list of nodes                   coming huge as the number of candidate acquisition grows,
+((0, t0 ), (k, tk ), . . . (n, tn )) in which (0, t0 ) is the source   making it unsuitable as an input to a GNN-based agent. For
+node and successive pairs of nodes in the path are arcs.               this reason, we derive from the discrete graph G D a (much)
+Nodes that are not part of the path are considered as not se-          more compact graph G C that we call the “continuous graph”
+lected. When building sequentially a schedule, the discrete            and use it as an input for the agent.
+graph can be simplified accordingly, as detailed as follows.
+Let m denote the last node in a schedule σ. When adding a              3.3    Our Approach : Continuous-Time Graph
+new node n = (i, ti ) to σ, the graph is updated in the fol-
+lowing way: (1) all arcs outgoing from node m are removed,             The continuous graph G C is built upon the discrete graph
+except the one leading to the newly scheduled node n; (2)              G D as follows. In G C , a node is simply defined by a candi-
+all other nodes candidate for observation i (nodes (i, t′i ) with      date observation i, with no mention of its exact starting time.
+t′ i ̸= ti ) are deleted; (3) all nodes that are unreachable from      An arc (i, j) is present in G C if and only if there is an arc
+n are removed.                                                         ((i, ti ), (j, tj )) in G D . Note that this may lead to two-nodes-
+    The discrete graph is convenient for a typical state-space         cycles if the corresponding observations may be performed
+approach such as using an implicit enumeration algorithm               in any order. In G C , the set of every cycle-free path is a su-
+(Dijkstra, A*) or Dynamic Programming. Our solution tech-              per set of the possible schedules: after selecting some ac-
+nique is based on representing the process of building an              quisitions, VTW for later acquisitions may shrink to empty
+optimal schedule for an instance of the EOSP as a reinforce-           time windows, making these later acquisitions impossible to
+ment learning problem.                                                 select.
+                                                                          The continuous graph G C cannot be used only by itself in
+3.2   Sequential Decision Model                                        the RL approach, as it does not contain the precise transi-
+                                                                       tion duration information. However, it is compact enough to
+Reinforcement learning is concerned with learning the so-              be used as an input for a GNN-based agent. Therefore, our
+lution of a Markov Decision Process (MDP), which is a                  RL approach uses both graph representations. As illustrated
+discrete-time sequential decision model. An MDP is defined
+as a tuple (S, A, T, R) where S is the state space, A the ac-             2
+                                                                            Note that non-deterministic MDPs could be considered in the
+tion space, T the transition matrix, and R the reward func-            EOSP to account for the cloud cover uncertainty. Such an aspect is
+tion (Puterman 2014). The definition of these elements flows           out of scope in this work.
+              Agent
+                                  Node                           graph      Value                    graphs provided as input are processed by several elements.
+                                                                 logit
+                Graph
+                                 Embedder                                 Estimator                  First, the graph is transformed in order to allow bidirec-
+                                                         GNN
+               Rewirer
+                                                                 nodes
+                                                                                                     tional message-passing by the GNN, then simple networks
+                                   Edge                                   Action
+                                 Embedder                        logits   Selector                   produce node and edge embeddings. Next the graph is pro-
+   Partial                           update parameters
+                                                                                                     cessed through a Message-Passing Graph Neural Network
+  schedule                                               value
+                                                                                        Action
+                                                                                                     (MP-GNN) to extract features capturing relevant informa-
+(continuous                                 PPO
+   graph)                                       reward                                   (next       tion, and produce action probabilities. Finally, the RL algo-
+                                                                                      acquisition)
+                                                                                                     rithm updates the parameters of the whole system, embed-
+                         Simulator
+                                                                                                     ders and GNN, based on the rewards received. For ease of
+                         Discrete and Continuous Graphs Update                                       presentation, we first discuss the RL algorithm, then the em-
+                                                                                                     bedders and GNN.
+              Figure 2: Wheatley general architecture
+                                                                                                     4.1   Reinforcement Learning
+                                                                                                     As our core algorithm, we use the Proximal Policy Opti-
+on Figure 2, the agent is fed with the compact continuous                                            mization (PPO) algorithm (Schulman et al. 2017) with ac-
+graph G C and selects the next acquisition i to be inserted in                                       tion masking (Huang and Ontañón 2022), due to its relative
+the schedule. To track which candidate observations are the                                          simplicity and its good results on many different problems.
+possible next actions, the simulator uses the discrete graph                                            A peculiar aspect of the EOSP instances we have to solve
+G D and assumes that observation i is started at its earliest                                        is that the utility of different acquisitions may vary by up to 8
+possible (discrete) time. The discrete graph G D is updated                                          degrees of magnitude. In fact, acquisitions are grouped in 7
+with this decision as described previously, and these changes                                        priority classes with utility value ranging from 1 to 108 . The
+are then reflected in the continuous graph G C . The resulting                                       utility of the observations within a class of priority is equal
+continuous graph is fed to the GNN-based agent at the next                                           to the value of that class, plus a small term depending on the
+iteration. The set of candidate acquisitions that can be added                                       predicted cloud coverage at the location of the acquisition
+to the current schedule is the set of immediate successors                                           (in order to favor acquisitions that are likely to happen with
+of the last node scheduled in the discrete graph G D . Note                                          a clear sky). This generates instability in DRL algorithms
+that node features of the continuous graph contain informa-                                          (and in MDPs in general), as the low priority observations
+tion about transition durations (see Section 4.2). In terms of                                       provide a reward that might be difficult to distinguish from
+the associated MDP, the learner solves partially-observable                                          noise in the algorithm. In addition, the critic must learn very
+MDP (POMDP) (Kaelbling, Littman, and Cassandra 1998),                                                large values, starting from very low values at initialization,
+where partial observability concerns only the transition du-                                         and following tiny gradient steps. This makes learning slow
+rations, and thus plays a minor role.                                                                and inefficient.
+   In the approach presented here, the discrete graph is used                                           We tried several approaches to handle this, including us-
+both for building the continuous graph and as a simulator                                            ing a logarithmic scale and 2-hot encoding (Hafner et al.
+of the learned strategy. Having a satellite simulator capable                                        2024). In our current implementation, we simply divide each
+of getting the attitudes and transition times on-the-fly would                                       individual reward by the average utility of all candidate ob-
+remove the discrete graph building requirement, without sig-                                         servations in the problem. This is a simple way to remedy
+nificant change in our approach. At the time of writing, the                                         the issue of having to learn very large values, but it does
+discrete graph is precomputed by calling a closed-source                                             not fix the problem of the discrepancy between rewards (un-
+proprietary satellite simulator, and there is no simple legal                                        less some extreme priority classes are not represented in the
+way to switch to the “on-the-fly” approach.                                                          problem instance). We are currently examining optimization
+                                                                                                     with lexicographic preferences (Skalse et al. 2022).
+                             4         Solution
+Following (Infantes et al. 2024), we use a reinforcement                                             4.2   GNN Implementation
+learning setup where the agent receives continuous graphs                                            Node attributes To inform the learner, we label each node
+representing partial schedules as input, selects the next ob-                                        i of the continuous graph G C with the visibility window Wi .
+servations to schedule, and updates its parameters based on                                          The continuous graph does not bring any information about
+the reward representing the cumulative utility of the sched-                                         the transition duration to the learner. To compensate for this,
+ules it produces. For a given problem, a simulator is in                                             each node i of the continuous graph is labeled with informa-
+charge of managing the different graphs and feeding the                                              tion about the satellite attitude while performing observation
+learner with the appropriate data. The learner implements                                            i, namely, the min, max and average pitch and roll angles of
+a policy, that is, a stochastic mapping from states s to ac-                                         the satellite over the observation VTW. Although this infor-
+tions a as defined above. It learns a policy that maximizes                                          mation is not sufficient to recover the exact duration of tran-
+the reward function over a base of real-world problems used                                          sitions, it allows the learner to infer them closely enough to
+as training set. The policy has to be able to generalize to test                                     perform well, as shown in our simulation results.
+problems, that is, exhibit good performances without further
+learning on a set of instances not seen before.                                                      Graph rewiring A Message-Passing Graph Neural Net-
+   An overview of the architecture is shown in Fig. 2. The                                           work (MP-GNN) (Xu et al. 2019) uses a graph structure
+as a computational lattice. It propagates information, rep-             last layer of the GNN, or use a concatenation of the log-
+resented as messages, along the oriented graph edges only.              its output from every layer. We chose to concatenate the
+In our case, if an MP-GNN uses only the EOSP continuous                 global graph logits of every layer, leading to a data size
+graph edges, then information cannot flow from future ac-               of ((n layers + 1)×hidden dim) × 2 per node, where hid-
+quisitions to the present choice of the next acquisition. This          den dim is the dimension of the embeddings. This dimen-
+is definitely not what is desired: the agent should choose the          sion is reduced to 1 using a learnable linear combination,
+next observation to schedule based on its effect on future              that is, a minimal case of a Multi-Layer Perceptron (MLP).
+conflicts. In other words, we want information to go from               We did not find using a larger MLP to be useful. Finally, a
+future to present tasks. Therefore, we edit the input graph             distribution is built upon these logits by normalizing them,
+before it can be used by the MP-GNN. This is known in the               and using action masks to remove actions that are not feasi-
+MP-GNN literature as “graph rewiring”.                                  ble in the current state. As node numbers correspond to ac-
+   For every (precedence) edge in the continuous graph, a               tion/acquisition numbers, we directly have the action identi-
+link pointing in the other direction is added to the rewired            fier when drawing a value from the distribution.
+graph (reverse-precedence). Different edge types are defined
+                                                                        Dealing with different problem sizes The GNN outputs
+for precedence and reverse-precedence edges, to enable the
+                                                                        a logit per node, and there is a one-to-one mapping between
+learned operators to differentiate between chronological and
+                                                                        nodes and actions whatever the number of nodes/actions.
+reverse-chronological links. The system learns to pass infor-
+                                                                        Learning the best action boils down to node regression, with
+mation in a forward and backward way, depending on what
+                                                                        target values being given by the reinforcement learning loop.
+is found useful during learning.
+                                                                        Internally, the message passing scheme collects messages
+Embeddings A graph embedder builds the rewired graph                    from all neighbors, making the whole pipeline agnostic to
+by adding edges. It embeds node attributes (VTW, attitude               the number of nodes.
+stats) using a learnable MLP, and edge attributes (type of              Connecting to PPO In most generic PPO implementa-
+edge) using a learnable embedding. The output dimension                 tions, the actor (policy) consists of a feature extractor whose
+of embeddings is an open hyper-parameter hidden dim. We                 structure depends on the data type of the observation, fol-
+found a size of 64 being good in our experiments.                       lowed by a MLP whose output dimension matches the num-
+Graph pooling A node is added and connected to every                    ber of actions. The same holds for the critic (value estima-
+other node to allow collecting global information about the             tor), with the difference that the output dimension is 1. Some
+entire graph, as opposed to the local information associated            layers can be shared (the feature extractor and first layers of
+with the nodes of the original graph. It is used by the critic to       the MLPs). In our case, we do not want to use such a generic
+estimate the value of the graph as a whole. It is also used by          structure because we have a one-to-one matching from the
+the actor, where the global graph encoding is concatenated              number of nodes to the actions. We thus always keep the
+to each node embedding. Indeed, messages are passed by                  number of nodes as a dimension of the data tensors.
+the MP-GNN algorithm only between immediate neighbors.
+Therefore, a network of depth n layers is able to anticipate            4.3   Inference Time Search
+only n layers observations ahead. Having the global node                Ideally, the agent should be able to select the best action sim-
+embedding concatenated to each node embedding compen-                   ply by selecting the argmax of the scores of the candidate ac-
+sates for this, allowing the current decision to take into ac-          tions. But several reasons may lead to suboptimal behavior
+count the entire graph.3                                                doing so: the learning may not be finished (for instance if
+                                                                        a plateau is reached during learning phase), the GNN may
+GNN As a message passing GNN, we use EGATConv                           not be able to retain information far enough into the fu-
+from the DGL library (Wang et al. 2019), which enriches                 ture of the current schedule (due to GNN over-smoothing
+GATv2 graph convolutions (Brody, Alon, and Yahav 2021)                  or over-squashing, and due to the fact that we choose ac-
+with edge attributes. We used 4 attention heads, leading to             tions chronologically), or the agent may not have enough
+an output of size 4×hidden dim. This dimension is reduced               generalization ability (it learns on a given set of scenarios,
+to hidden dim using learnable MLPs, before being passed to              and it is difficult to measure the closeness of these setups to
+the next layer (in the spirit of feed-forward networks used             evaluation/real-world setups). For all these reasons, we pro-
+in transformers (Vaswani et al. 2017)). The output of a layer           pose to perform search at inference time, meaning after the
+can be summed with its input using residual connections (He             learning phase of the agent, in order to further refine the pol-
+et al. 2016). For most of our experiments, we used 10 such              icy. Several well-known techniques are possible, like beam
+layers. The message-passing GNN yields a value for every                search or Monte-Carlo Tree Search. We found beam search
+node and a global value for the graph (from the graph pool-             to be hard to evaluate because of the very large branching
+ing node).                                                              factor we face, leading to exploring very few beams in rea-
+Action selection Action selection aims at computing ac-                 sonable time/memory. We thus conducted some experiments
+tion probabilities given the node values (logits) output by             with MCTS, using PUCT bound (Silver et al. 2016).
+the GNN. We can either use the logits output from the                      For doing so, we allocate some budget for MCTS explo-
+                                                                        ration. One key aspect of MCTS is the way to set the ini-
+    3                                                                   tial value of expanded nodes; in most MCTS uses, random
+      Adding such a kind of node to the graph is equivalent to learn-
+ing a custom graph pooling operator.                                    rollouts are performed until the end in order to estimate a
+so-called empirical mean. In our case, as we have already                                    55
+
+learned a value function for the states in the learning phase,                               50
+we can directly plug this value as an initial estimate. Es-                                  45
+
+
+
+                                                                    Number of acquisitions
+timating the Q-value during selection also requires using                                    40
+a value for unexplored children nodes. Traditional MCTS
+                                                                                             35
+uses an infinite value that forces in-breadth exploration of
+children. This is detrimental when the simulation budget is                                  30
+                                                                                                                                                                            Wheatley
+low wrt. the action space, as is in EOSP tasks. Here we                                      25                                                                             Ramp
+                                                                                                                                                                            Greedy
+copy the parent’s estimated value to the unexplored children
+                                                                                                     0              20          40                    60          80               100
+(Cazenave 2021).                                                                                                                     Training steps
+
+
+                    5    Experiments                               Figure 3: Unitary scores: single problem of 106 acquisitions.
+We use a set of real-life non-public problems consisting of
+100 to 1500 candidate acquisitions to be scheduled over a
+                                                                                             42.5
+single orbit. From those, there’s room for only about 50 of                                  40.0
+them to be selected for execution, yielding a largely over-
+
+
+                                                                    Number of acquisitions
+                                                                                             37.5
+subscribed problem for every orbit. As explained in Sec-                                     35.0
+tion 3, problems are given in the form of discrete graphs.                                   32.5
+The simulator uses this graph to compute and maintain the                                    30.0
+continuous-time graph. To provide intuition on the difficulty                                27.5
+                                                                                                                                                                            Wheatley
+of the problem, Table 1 shows some statistics on a few test                                  25.0                                                                           Ramp
+                                                                                                                                                                            Greedy
+problems and their representation as graphs.                                                 22.5
+                                                                                                         0    200         400    600           800         1000    1200        1400
+   We compare our DRL approach, Wheatley, to two solu-                                                                             Training steps
+tions currently being used for operating such satellites.
+                                                                   Figure 4: Unitary scores: performance on 31 unseen prob-
+Greedy algorithm It is the algorithm currently used for
+                                                                   lems (training on 128 different problems)
+real-world operations. It greedily selects acquisitions to add
+to the schedule based on their utility, and inserts them in the
+plan if possible. Previously selected tasks may be slightly
+postponed, but never canceled.                                     Generalization To measure the ability to transfer knowl-
+                                                                   edge from one task to another, we train on 128 problems
+RAMP (Blanc-Pâques 2019): It is an implementation of              of about 100 acquisitions and test on 31 unseen problems of
+a Dijkstra search algorithm in the discrete graph. Although        similar size. The learning curve of Fig. 4 shows the evolution
+based on an admissible algorithm (Dijkstra), RAMP is not           of the performance on the test set, as learning progresses. It
+guaranteed to find the absolute optimal schedule. This is due      peaks at around 600 training steps before slowly decreas-
+to the exclusion links between nodes of the discrete graph         ing due to overfitting. We also measure the number of times
+that represent different start dates of the same task. Never-      where Wheatley’s performances are above, below or equal
+theless, RAMP constantly provides the best known sched-            to the greedy algorithm (Fig. 5) and RAMP (Fig. 6) on the
+ules on real problems. Unfortunately, its complexity pre-          31 test problems. This shows that our system is able to gen-
+vents using it for real-time operations. Therefore, it is used     eralize to unseen problems, outperforming the currently de-
+as a reference in these simulation results.                        ployed solution.
+
+5.1   Unitary Score                                                                          30
+First, we compare our approach to baselines on a relaxed                                     25
+problem: we try to maximize the number of acquisitions
+
+
+                                                                    Number of problems
+                                                                                             20
+scheduled, irrespectively of their priority or utility. This                                                                                                           Wheatley above
+measure of performance is insensitive to the large gaps in                                   15                                                                        Wheatley below
+                                                                                                                                                                       Wheatley equal
+acquisitions utility discussed in Section 4.1. We run two ex-                                10
+periments:                                                                                    5
+Single problem First, we want to measure if our mod-                                          0
+els and algorithms can possibly achieve competitive perfor-                                          0       200         400    600           800
+                                                                                                                                  Training steps
+                                                                                                                                                           1000   1200         1400
+mance on a given problem. We train our learner on a single
+problem with a total of 106 acquisitions and let it overfit as
+                                                                                                    Figure 5: Unitary scores: Wheatley vs. Greedy
+much as needed, as long as it achieves great performance. As
+illustrated in Fig. 3, we observe that it is indeed able to out-
+perform both the greedy algorithm and RAMP scores. This
+result shows that our architecture is able to implement very       5.2                              General Utility
+powerful policies. In the next set of experiments, we put it       In our second set of experiments, we take into account the
+to the challenge of a realistic learning environment.              utility of observations and aim at maximizing the cumulative
+                                                                                            # Nodes                                                             # Edges
+                                       # Acquisitions            Discrete graph            Continuous graph       Ratio                     Discrete graph      Continuous graph           Ratio
+                                                  106                    10297                         106         97                             835566                  9273                90
+                                                  308                    52020                         308        169                            12598738                81244               155
+                                                  508                    46589                         508         92                            14842035               225398                66
+                                                  809                    59583                         809         74                            28015753               447945                63
+                                                 1074                    94071                        1074        88                             58343397               741634               79
+
+                                                                                          Table 1: Representative problem sizes
+
+
+                                                                                                                                                1e8
+                      30
+                                                                                                                                         6.00
+                      25                                                                                                                 5.75
+
+
+
+
+ Number of problems
+                      20                                                                                                                 5.50
+
+
+                                                                                                                     Operational score
+                                                                                                Wheatley above
+                      15                                                                        Wheatley below                           5.25
+                                                                                                Wheatley equal
+                                                                                                                                         5.00
+                      10
+                                                                                                                                         4.75
+                       5                                                                                                                                                                                  Wheatley
+                                                                                                                                         4.50                                                             Ramp
+                       0                                                                                                                                                                                  Greedy
+                                                                                                                                         4.25
+                              0       200        400    600           800          1000     1200        1400                                          0   200     400           600        800     1000       1200
+                                                          Training steps                                                                                                  Training steps
+
+
+                            Figure 6: Unitary scores for Wheatley vs. Ramp                                         Figure 8: Utilities obtained averaging on 27 unseen prob-
+                                                                                                                   lems after a training on 639 different problems
+
+utility of all the observations included in the final schedule,
+as in the full-fledged MDP framework presented in Section                                                          are presented in Fig. 10. We see that Wheatley outperforms
+4.1. As before, we perform two sets of experiments: one                                                            the deployed solution and approaches the best known perfor-
+where the learner is free to overfit on a single problem to                                                        mances, in a realistic set-up where problems are not known
+reach its best performance, and one aiming at measuring its                                                        in advance. Fig. 11 shows examples of satellite trajectories
+ability to generalize.                                                                                             produced by Greedy and Wheatley. It represents the roll an-
+                                                                                                                   gle (X-axis) at each acquisition date (Y-axis). Acquisition
+Single Problem Our test on a single problem with a total                                                           requests are depicted in gray during their VTW. Manoeu-
+of 88 candidate acquisitions shows that our system is able                                                         vers between acqusitions are the colored arrows describing
+to outperform the greedy algorithm and reach the score of                                                          the satellite depointing angle along time. We can see that
+RAMP (Figure 7). This proves the suitability of the archi-                                                         Wheatley finds a smoother and more efficient sequence for
+tecture for the full MDP set up.                                                                                   the satellite.
+                                                                                                                      Table 2 shows comprehensive results for the agent trained
+                            1e9                                                                                    on problems of size 100, evaluated on different sizes of prob-
+                      5.5
+
+                      5.0
+                                                                                                                   lems. The last line is an evaluation on instances with many
+                                                                                                                   conflicts, where RAMP performs worse than the greedy al-
+                      4.5
+
+
+ Operational score
+                                                                                                                   gorithm. Results show that Wheatley performs very well on
+                                                                                                     Wheatley
+                      4.0                                                                            Ramp          not too large instances but is outperformed by the greedy
+                                                                                                     Greedy
+                                                                                                                   approach on the largest instance. However, it is quite com-
+                      3.5
+                                                                                                                   petitive in the case of highly conflictual instances, which is
+                      3.0                                                                                          promising for future works.
+                                  0         20          40                    60           80               100
+                                                             Training steps                                        5.3                          Inference Time MCTS
+                                                                                                                   Results of policy search after learning is shown on Table
+Figure 7: Utilities obtained when training on a single prob-                                                       3, though on a different dataset4 than in Table 2. In this
+lem with 88 acquisitions                                                                                           new dataset, the average number of selectable acquisitions is
+                                                                                                                   about 15, but the number of priority levels is higher, leading
+                                                                                                                   to larger operational scores when selecting high priorities.
+Generalization We train on 639 problems of about 100                                                               The displayed scores are the mean over the test set.
+acquisitions and test on 27 unseen problems of similar size.                                                          The budget is the number of trials done (i.e. the number
+The learning curves are displayed in Figure 8 and show that                                                        of paths leading to tree expansion and backtrack of the es-
+the learner is able to generalize. The plot showing the num-
+ber of times where Wheatley is above, below or equal to the                                                            4
+                                                                                                                         The satellite target was updated during the work with support
+greedy solution are presented in Fig. 9 and same for RAMP                                                          for a larger set of priority levels.
+                                              Instances Set                               Average Utility Score                                     Avg. Scores Ratios
+                                                                                                                                                    Wheatley        Wheatley
+                                           #Acq.     #Instances             Wheatley                 Greedy                       Ramp              Greedy           Ramp
+
+                                             100             27            605,732,913             510,488,439           605,894,711                1.1788         0.9901
+                                             300             30            239,934,939             202,565,994           263,514,132                1.2560         0.9420
+                                             508             1               221,226                 142,487               308,355                  1.5526         0.7174
+                                             809             1              52,000,039              49,000,279            59,000,286                1.0612         0.8814
+                                            1074             1            2,910,000,156           2,225,103,224         4,124,116,197               1.3078         0.7056
+                                            1591             1               220,734                 307,159               393,214                  0.7186         0.5614
+                                            100              10           689,578,101             688,941,262            678,921,586                0.9996         1.0115
+
+                                             Table 2: Average scores obtained when generalizing on different instances sets.
+
+
+                                                                                                                             2020-Feb-21
+                      25
+                                                                                                                     02:37
+                      20
+
+
+
+ Number of problems
+                                                                                                                     02:36
+                      15                                                         Wheatley above
+                                                                                 Wheatley below
+                                                                                 Wheatley equal               Date   02:35
+                      10
+                                                                                                                     02:34
+                      5
+                                                                                                                     02:33         Greedy
+                      0                                                                                                            Wheatley
+                           0         200     400         600        800        1000        1200                              30                20              10                0    10
+                                                   Training steps                                                                                              Psi x angle (°)
+
+
+                           Figure 9: Utilities for Wheatley vs. Greedy
+                                                                                                           Figure 11: Trajectories found by Wheatley and Greedy ap-
+                                                                                                           proaches on a 87 acquisitions instance.
+                      25
+                                                                                                                                              score (×1017 )           ≥ RAMP (%)    time (min)
+                      20                                                                                          RAMP                           8.62747                   100
+
+
+ Number of problems
+                      15                                                         Wheatley above                 Wheatley                         8.38172                 28.7356
+                                                                                 Wheatley below                MCTS(100)                         8.45111                 37.9310           138
+                                                                                 Wheatley equal
+                      10                                                                                      MCTS(1000)                         8.56566                 43.6782           1248
+                      5
+                                                                                                                                           Table 3: MCTS(budget) results
+                      0
+                           0         200     400         600        800        1000        1200
+                                                   Training steps
+                                                                                                                                                    6   Conclusion
+                               Figure 10: Utilities for Wheatley vs. Ramp                                  We showed that DL-based approaches to the EOSP chal-
+                                                                                                           lenge some of the best known techniques. There are sev-
+                                                                                                           eral perspectives we are currently exploring to extend this
+timates along the path) before selecting an action. MCTS                                                   work. First, as stated before, we are trying to take ad-
+uses the learned value network to get initial evaluation of                                                vantage of the large discrepancy in acquisition utility by
+new nodes. Two criterions are of interest: the mean abso-                                                  using lexicographic RL algorithms such as (Skalse et al.
+lute score on the test set, and the number of times where                                                  2022). Scheduling tasks by decreasing priority would pro-
+the MCTS search is better than RAMP reference. The re-                                                     vide stronger guarantees to find the optimal schedule. To
+sults show that using MCTS at resolution times consistently                                                achieve this, schedules must be built in a non-chronological
+improves found solutions over “vanilla” Wheatley.                                                          order, which is not the case in our current implementation.
+   It is worth noting that such budgets are small compared                                                 Currently, we choose the next acquisition to insert just af-
+to the problem sizes, as the problems exhibit a large branch-                                              ter the last inserted one, using some foresight given by the
+ing factor. For instance, in a problem of 100 acquisitions, a                                              GNN. This foresight is limited by the number of layers of
+budget of 100 allows only tree exploration until a depth of 6,                                             the GNN. As we said, the discrete-time graph is tailored
+which is very far from the maximal depth of the tree (which                                                for state-space search and chronological insertion. Future
+could be up to 100 if all acquisitions are selectable). We                                                 work will consider developing an alternative continuous-
+are limited to such small budgets in order to perform search                                               time graph representation of the EOSP where observations
+phase in sensible time: due to the update of discrete graphs                                               can be added to the schedule in any order, using Simple Tem-
+and computations of continuous graphs at every node, this                                                  poral Networks (Dechter, Meiri, and Pearl 1991). Such work
+search phase duration is far from negligible, as shown in the                                              will open promising avenues for using lexicographic prefer-
+results table.                                                                                             ences.
+                        References                                Puterman, M. L. 2014. Markov decision processes: discrete
+Blanc-Pâques, P. 2019. Method for Planning the Acquisi-          stochastic dynamic programming. John Wiley & Sons.
+tion of Images of Areas of the Earth by a Spacecraft. In          Schulman, J.; Wolski, F.; Dhariwal, P.; Radford, A.; and
+US10392133B2. (US. PATENT).                                       Klimov, O. 2017. Proximal Policy Optimization Algorithms.
+Brody, S.; Alon, U.; and Yahav, E. 2021. How Attentive are        arXiv:1707.06347.
+Graph Attention Networks? CoRR, abs/2105.14491.                   Silver, D.; Huang, A.; Maddison, C. J.; Guez, A.; Sifre,
+Cazenave, T. 2021. Batch Monte Carlo Tree Search. CoRR,           L.; van den Driessche, G.; Schrittwieser, J.; Antonoglou,
+abs/2104.04278.                                                   I.; Panneershelvam, V.; Lanctot, M.; Dieleman, S.; Grewe,
+Chun, J.; Yang, W.; Liu, X.; Wu, G.; He, L.; and Xing, L.         D.; Nham, J.; Kalchbrenner, N.; Sutskever, I.; Lillicrap, T.;
+2023. Deep Reinforcement Learning for the Agile Earth             Leach, M.; Kavukcuoglu, K.; Graepel, T.; and Hassabis, D.
+Observation Satellite Scheduling Problem. Mathematics,            2016. Mastering the Game of Go with Deep Neural Net-
+11(19).                                                           works and Tree Search. Nature, 529(7587): 484–489.
+Dalin, L.; Haijiao, W.; Zhen, Y.; Yanfeng, G.; and Shi, S.        Skalse, J.; Hammond, L.; Griffin, C.; and Abate, A. 2022.
+2021. An Online Distributed Satellite Cooperative Observa-        Lexicographic Multi-Objective Reinforcement Learning. In
+tion Scheduling Algorithm Based on Multiagent Deep Rein-          Proceedings of the Thirty-First International Joint Confer-
+forcement Learning. IEEE Geoscience and Remote Sensing            ence on Artificial Intelligence, IJCAI-2022. International
+Letters, 18(11): 1901–1905.                                       Joint Conferences on Artificial Intelligence Organization.
+Dechter, R.; Meiri, I.; and Pearl, J. 1991. Temporal con-         Squillaci, S.; Pralet, C.; and Roussel, S. 2023a. Compari-
+straint networks. Artificial Intelligence, 49(1): 61–95.          son of time-dependent and time-independent scheduling ap-
+                                                                  proaches for a constellation of Earth observing satellites.
+Feo, T.; and Resende, M. 1995. Greedy Randomized Adap-
+                                                                  In Proceedings of the Thirteenth International Workshop on
+tive Search Procedures. Journal of Globlal Optimization, 6:
+                                                                  Planning and Scheduling for Space, 96–104.
+109–133.
+                                                                  Squillaci, S.; Pralet, C.; and Roussel, S. 2023b. Scheduling
+Hafner, D.; Pasukonis, J.; Ba, J.; and Lillicrap, T.
+                                                                  Complex Observation Requests for a Constellation of Satel-
+2024. Mastering Diverse Domains through World Models.
+                                                                  lites: Large Neighborhood Search Approaches. In Inter-
+arXiv:2301.04104.
+                                                                  national Conference on Integration of Constraint Program-
+He, K.; Zhang, X.; Ren, S.; and Sun, J. 2016. Deep Residual       ming, Artificial Intelligence, and Operations Research, 443–
+Learning for Image Recognition. In 2016 IEEE Conference           459. Springer.
+on Computer Vision and Pattern Recognition (CVPR), 770–
+                                                                  Vaswani, A.; Shazeer, N.; Parmar, N.; Uszkoreit, J.; Jones,
+778.
+                                                                  L.; Gomez, A. N.; Kaiser, L. u.; and Polosukhin, I. 2017.
+Herrmann, A.; and Schaub, H. 2023. Reinforcement Learn-           Attention is All you Need. In Guyon, I.; Luxburg, U. V.;
+ing for the Agile Earth-Observing Satellite Scheduling Prob-      Bengio, S.; Wallach, H.; Fergus, R.; Vishwanathan, S.; and
+lem. IEEE Transactions on Aerospace and Electronic Sys-           Garnett, R., eds., Advances in Neural Information Process-
+tems, PP: 1–13.                                                   ing Systems, volume 30. Curran Associates, Inc.
+Huang, S.; and Ontañón, S. 2022. A Closer Look at Invalid       Wang, M.; Yu, L.; Zheng, D.; Gan, Q.; Gai, Y.; Ye, Z.; Li,
+Action Masking in Policy Gradient Algorithms. The Inter-          M.; Zhou, J.; Huang, Q.; Ma, C.; Huang, Z.; Guo, Q.; Zhang,
+national FLAIRS Conference Proceedings, 35.                       H.; Lin, H.; Zhao, J.; Li, J.; Smola, A. J.; and Zhang, Z.
+Infantes, G.; Roussel, S.; Pereira, P.; Jacquet, A.; and Benaz-   2019. Deep Graph Library: Towards Efficient and Scalable
+era, E. 2024. Learning to Solve Job Shop Scheduling under         Deep Learning on Graphs. CoRR, abs/1909.01315.
+Uncertainty. In 21th International Conference on Integra-         Wang, X.; Wu, G.; Xing, L.; and Pedrycz, W. 2021. Agile
+tion of Constraint Programming, Artificial Intelligence, and      Earth Observation Satellite Scheduling Over 20 Years: For-
+Operations Research (CPAIOR).                                     mulations, Methods, and Future Directions. IEEE Systems
+Kaelbling, L. P.; Littman, M. L.; and Cassandra, A. R. 1998.      Journal, 15(3): 3881–3892.
+Planning and Acting in Partially Observable Stochastic Do-        Xu, K.; Hu, W.; Leskovec, J.; and Jegelka, S. 2019. How
+mains. Artificial Intelligence, 101: 99–134.                      Powerful are Graph Neural Networks? In International Con-
+Lemaı̂tre, M.; Verfaillie, G.; Jouhaud, F.; Lachiver, J.-M.;      ference on Learning Representations.
+and Bataille, N. 2002. Selecting and scheduling observations      Yang, X.; Wang, Z.; Zhang, H.; Ma, N.; Yang, N.; Liu, H.;
+of agile satellites. Aerospace Science and Technology, 6(5):      Zhang, H.; and Yang, L. 2022. A Review: Machine Learning
+367–381.                                                          for Combinatorial Optimization Problems in Energy Areas.
+Peng, S.; Chen, H.; Du, C.; Li, J.; and Jing, N. 2018.            Algorithms, 15(6).
+Onboard Observation Task Planning for an Autonomous
+Earth Observation Satellite Using Long Short-Term Mem-
+ory. IEEE Access, 6: 65118–65129.
+Pralet, C. 2023. Iterated Maximum Large Neighborhood
+Search for the Traveling Salesman Problem with Time Win-
+dows and its Time-dependent Version. Comput. Oper. Res.,
+150: 106078.
+

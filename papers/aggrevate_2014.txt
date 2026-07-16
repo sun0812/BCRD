@@ -1,0 +1,993 @@
+                                                      Reinforcement and Imitation Learning
+                                                       via Interactive No-Regret Learning
+
+
+                                                                   Stéphane Ross    J. Andrew Bagnell
+
+
+
+
+arXiv:1406.5979v1 [cs.LG] 23 Jun 2014
+                                                           stephaneross@cmu.edu dbagnell@ri.cmu.edu
+                                                                          The Robotics Institute
+                                                                        Carnegie Mellon University,
+                                                                           Pittsburgh, PA, USA
+
+
+
+                                                                                     Abstract
+                                                 Recent work has demonstrated that problems– particularly imitation learning
+                                                 and structured prediction– where a learner’s predictions influence the input-
+                                                 distribution it is tested on can be naturally addressed by an interactive approach
+                                                 and analyzed using no-regret online learning. These approaches to imitation learn-
+                                                 ing, however, neither require nor benefit from information about the cost of ac-
+                                                 tions. We extend existing results in two directions: first, we develop an interactive
+                                                 imitation learning approach that leverages cost information; second, we extend the
+                                                 technique to address reinforcement learning. The results provide theoretical sup-
+                                                 port to the commonly observed successes of online approximate policy iteration.
+                                                 Our approach suggests a broad new family of algorithms and provides a unifying
+                                                 view of existing techniques for imitation and reinforcement learning.
+
+
+                                        1 Introduction
+                                        Imitation learning has become increasingly important in fields– notably robotics and game AI–
+                                        where it is easier for an expert to demonstrate a behavior than to translate that behavior to code.
+                                        [1] Perhaps surprisingly, it has also become central in developing predictors for complex output
+                                        spaces, e.g. sets and lists [22], parse trees [10], image parsing [20, 25] and natural language
+                                        understanding[12]. In these domains, a policy is trained to imitate an oracle on ground-truthed
+                                        data. Iterative training procedures (e.g. DAGGER, SEARN, SMIL E[24, 10, 21]) that interleave
+                                        policy execution and learning have demonstrated impressive practical performance and strong theo-
+                                        retical guarantees that were not possible with batch supervised learning. Most of these approaches to
+                                        imitation learning, however, neither require nor benefit from information about the cost of actions;
+                                        rather they leverage only information provided about “correct” actions by the demonstrator.
+                                        While iterative training corrects the compounding of error effect one sees in control and decision
+                                        making applications, it does not address all issues that arise. Consider, for instance, a problem of
+                                        learning to drive near the edge of a cliff: methods like DAGGER consider all errors from agreeing
+                                        with the expert driver equally. If driving immediately off the cliff makes the expert easy to imitate–
+                                        because the expert simply chooses the go straight from then on– these approaches may learn that
+                                        very poor policy. More generally, a method that only reasons about agreement with a demonstrator
+                                        instead of the long term costs of various errors may poorly trade-off inevitable mistakes. Even a
+                                        crude estimate of the cost-to-go (e.g. it’s very expensive to drive off the cliff)– may improve a
+                                        learned policy’s performance at the user’s intended task.
+                                        SEARN, by contrast, does reason about cost-to-go, but uses rollouts from the current policy which
+                                        can be impractical for imitation learning. SEARN additionally requires the use of stochastic policies.
+                                        We present a simple, general approach we term AGGRE VAT E (Aggregate Values to Imitate) that
+                                        leverages cost-to-go information in addition to correct demonstration, and establish that previous
+
+                                                                                          1
+methods can be understood as special cases of a more general no-regret strategy. The approach
+provides much stronger guarantees than existing methods by providing a statistical regret rather
+then statistical error reduction. [8]
+This general strategy of leveraging cost-sensitive no-regret learners can be extended to Approximate
+Policy Iteration (API) variants for reinforcement learning. We show that any no-regret learning al-
+gorithm can be used to develop stable API algorithms with guarantees as strong as any available
+in the literature. We denote the resulting algorithm NRPI. The results provide theoretical support
+to the commonly observed success of online policy iteration[29] despite a paucity of formal re-
+sults: such online algorithms often enjoy no-regret guarantees or share similar stability properties.
+Our approach suggests a broad new family of algorithms and provides a unifying view of existing
+techniques for both imitation and reinforcement learning.
+
+
+2 Imitation Learning with Cost-To-Go
+
+2.1 Preliminaries
+
+We consider in this work finite horizon1 control problems in the form of a Markov Decision Process
+with states s and actions a. We assume the existence of a cost-function C(s, a), bounded between
+0 and 1, that we are attempting to optimize over a horizon of T decisions. We denote a class of
+policies Π mapping states 2 to actions.
+We use Qπt (s, a) to denote the expected future cost-to-go of executing action a in state s, followed by
+                                                              PT
+executing policy π for t − 1 steps. We denote by dπ = T1 t=1 dtπ the time-averaged distribution
+over states induced by executing policy π in the MDP (dtπ is the distribution of states at time t
+induced by executing policy π). The overall performance metric of total cost of executing π for T -
+                          PT
+steps is denoted J(π) = t=1 Es∼dtπ [C(s, π(s))] We assume system dynamics are either unknown
+or complex enough that we typically have only sample access to them. The resulting setting for
+learning policies by demonstration– or learning policies by approximate policy iteration– are not
+typical i.i.d. supervised learning problems as the learned policy strongly influences its own test
+distribution rendering optimization difficult.
+
+2.2 Algorithm: AGGRE VAT E
+
+We describe here a simple extension of the DAGGER technique of [24] that learns to choose actions
+to minimize the cost-to-go of the expert rather than the zero-one classification loss of mimicking its
+actions. In simplest form, on the first iteration AGGRE VAT E collects data by simply observing the
+expert perform the task, and in each trajectory, at a uniformly random time t, explores an action a
+in state s, and observes the cost-to-go Q of the expert after performing this action. (See Algorithm
+1 below.) 3
+Each of these steps generates a cost-weighted training example (s, t, a, Q) [19] and AGGRE VAT E
+trains a policy π̂2 to minimize the expected cost-to-go on this dataset. At each following iteration n,
+AGGRE VAT E collects data through interaction with the learner as follows: for each trajectory, begin
+by using the current learner’s policy π̂n to perform the task, interrupt at a uniformly random time t,
+explore an action a in the current state s, after which control is provided back to the expert to con-
+tinue up to time-horizon T . This results in new examples of the cost-to-go of the expert (s, t, a, Q),
+under the distribution of states visited by the current policy π̂n . This new data is aggregated with
+all previous data to train the next policy π̂n+1 ; more generally, this data can be used by a no-regret
+online learner to update the policy and obtain π̂n+1 . This is iterated for some number of iterations
+N and the best policy found is returned. We optionally allow the algorithm to continue executing
+the expert’s actions with small probability βn , instead of always executing π̂n , up to the random
+time t where an action is explored and control is shifted to the expert. The general AGGRE VAT E is
+detailed in Algorithm 1.
+   1
+     All our results can be easily extended to the infinite discounted horizon setting.
+   2
+     More generally features of the state (and potentially time)– our derivations do not require full observability
+and hence carry over to featurized state of POMDPs.
+   3
+     This cost-to-go may be estimated by rollout, or provided by the expert.
+
+
+                                                        2
+Observing the expert’s cost-to-go indicates how much cost we might expect to incur in the future if
+we take an action now and then can behave as well (or nearly so) as the expert henceforth. Under
+the assumption that the expert is a good policy, and that the policy class Π contains similarly good
+policies, this provides a rough estimate of what good policies in Π will be able to achieve at future
+steps. By minimizing this cost-to-go at each step, we will choose policies that lead to situations
+where incurring low future cost-to-go is possible. For instance, we will be able to observe that if
+some actions put the expert in situations where falling off a cliff or crash is inevitable then these
+actions must be avoided at all costs in favor of those where the expert is still able to recover.
+
+Algorithm 1 AGGRE VAT E: Imitation Learning with Cost-To-Go
+  Initialize D ← ∅, π̂1 to any policy in Π.
+  for i = 1 to N do
+     Let πi = βi π ∗ + (1 − βi )π̂i #Optionally mix in expert’s own behavior.
+     Collect m data points as follows:
+     for j = 1 to m do
+        Sample uniformly t ∈ {1, 2, . . . , T }.
+        Start new trajectory in some initial state drawn from initial state distribution
+        Execute current policy πi up to time t − 1.
+        Execute some exploration action at in current state st at time t
+        Execute expert from time t + 1 to T , and observe estimate of cost-to-go Q̂ starting at time t
+     end for
+     Get dataset Di = {(s, t, a, Q̂)}
+                                    S of states, times, actions, with expert’s cost-to-go.
+     Aggregate datasets: D ← D Di .
+     Train cost-sensitive classifier π̂i+1 on D
+        (Alternately: use any online learner on the data-sets Di in sequence to get π̂i+1 )
+  end for
+  Return best π̂i on validation.
+
+In AGGRE VAT E the problem of choosing the sequence of policies π̂1 , π̂2 , . . . , π̂N over iterations is
+viewed as an online cost-sensitive classification problem. Our analysis below demonstrates that any
+no-regret algorithm on such problems can be used to update the sequence of policies and provide
+strong guarantees. To achieve this, when the policy class Π is finite, randomized online learning
+algorithms like weighted majority [9] may be used. When dealing with infinite policy classes (e.g.
+all linear classifiers), no-regret online cost-sensitive classification is not always computationally
+tractable. Instead, typically reductions of cost-sensitive classification to regression or ranking prob-
+lems as well as convex upper bounds [8] on the classification loss lead to efficient no-regret online
+learning algorithms (e.g. gradient descent). The algorithm description suggests as the “default”
+learning strategy a (Regularized)-Follow-The-Leader online learner: it attempts to learn a good clas-
+sifier for all previous data. This strategy for certain loss function (notably strongly convex surrogates
+to the cost-sensitive classification loss) [9] and any sufficiently stable batch learner [23, 27] ensures
+the no-regret property. It also highlights why the approach is likely to be particularly stable across
+rounds of interaction.
+
+2.3 Training the Policy to Minimize Cost-to-Go
+
+In standard “full-information” cost-sensitive classification, a cost vector is provided for each data-
+point in the training data that indicates the cost of predicting each class or label for this input.
+In our setting, that implies for each sampled state we recieve a cost-to-go estimate/rollout for all
+actions. Training the policy at each iteration then simply corresponds to solving a cost-sensitive
+classification problem. That is, if we collect a dataset of m samples, {(si , ti , Q̂i )}m
+                                                                                         i=1 , where Q̂i
+is a cost vector of cost-to-go estimates for each action in state si at time ti , then we solve the
+                                                    Pm
+cost-sensitive classification problem: arg minπ∈Π i=1 Q̂i (π(si , ti )). Reductions of cost-sensitive
+classification to convex optimization problems can be used like weighted multi-class Support Vector
+Machines or ranking[8], to obtain problems that can be optimized efficiently while still guaranteeing
+good performance at this cost-sensitive classification task.
+For instance, a simple approach is to transform this into an argmax regression prob-
+lem: i.e., πn (s, t) = arg mina∈A Qn (s, t, a), for Qn the learned regressor at itera-
+
+                                                    3
+tion n that minimizes the squared loss at predicting the cost-to-go estimates: Qn =
+arg minQ∈Q (si ,ti ,ai ,Q̂i )∈D (Q(si , ti , ai )− Q̂i )2 , where D is the dataset of all collected cost-to-go
+              P
+
+estimates so far, and Q the class of regressors considered (e.g. linear regressors). This approach also
+naturally handles the more common situation in imitation learning where we only have partial infor-
+mation for a particular action chosen at a state. Alternate approaches include importance weighting
+techniques to transform the problem into a standard cost-sensitive classification problem [14, 11]
+and other online learning approaches meant to handle “bandit” feedback.
+Local Exploration in Partial Information Setting In the partial information setting we must
+also select which action to explore for an estimate of cost-to-go. The uniform strategy is simple
+and effective but inefficient. The problem may be cast as a contextual bandit problem [2, 6] where
+features of the current state define the context of exploration. These algorithms, by choosing more
+carefully than at random, may be significantly more sample efficient. In our setting, in contrast with
+traditional bandit settings, we care only about the final learned policy and not the cost of explored
+actions along the way. Recent work [3] may be more appropriate for improving performance in this
+case. Many contextual bandit algorithms require a finite set of policies Π [2] or full realizability
+[18], and this is an open and very active area of research that could have many applications here.
+
+2.4 Analysis
+
+We analyze AGGRE VAT E, showing that the no-regret property of online learning procedures can
+be leveraged in this interactive learning procedure to obtain strong performance guarantees. Our
+analysis seeks to answer the following question: how well does the learned policy perform if we
+can repeatedly identify good policies that incur cost-sensitive classification loss competitive with
+the expert demonstrator on the aggregate dataset we collect during training?
+Our analysis of AGGRE VAT E relies on connecting the iterative learning procedure with the (adver-
+sarial) online learning problem [9] and using the no-regret property of the underlying cost-sensitive
+classification algorithm choosing policies π̂1:N . Here, the online learning problem is defined as
+follows: at each iteration i, the learner chooses a policy π̂i ∈ Π that incurs loss ℓi chosen by the
+adversary, and defined as ℓi (π) = Et∼U(1:T ),s∼dtπ [Q∗T −t+1 (s, π)] for U (1 : T ) the uniform distri-
+                                                        i
+bution on the set {1, 2, . . . , T }, πi = βi π ∗ + (1 − βi )π̂i and Q∗ the cost-to-go of the expert. We
+can see that AGGRE VAT E at iteration i is exactly collecting a dataset Di , that provides an empirical
+estimate of this loss ℓi .
+                           PN
+Let ǫclass = minπ∈Π N1                                ∗                     ∗
+                             i=1 Et∼U(1:T ),s∼dtπi [QT −t+1 (s, a)−mina QT −t+1 (s, a)] denote the min-
+imum expected cost-sensitive classification regret achieved by policies in the class Π on all the data
+over the N iterations of training. Denote the online learning average regret of the sequence of
+                                                   PN                      PN
+policies chosen by AGGRE VAT E, ǫregret = N1 [ i=1 ℓi (π̂i ) − minπ∈Π i=1 ℓi (π)].
+We provide guarantees for the “uniform mixture” policy π, that at the beginning of any trajectory
+samples a policy π uniformly randomly among the policies {π̂i }N    i=1 and executes this policy π
+for the entire trajectory. This immediately implies good performance for the best policy π̂ in the
+sequence π̂1:N , i.e. J(π̂) = mini∈1:N J(π̂i ) ≤ J(π), and the last policy π̂N when the distribution
+of visited states converges over the iterations of learning.
+Assume the cost-to-go of the expert Q∗ is non-negative and bounded by Q∗max , and βi ≤ (1 − α)i−1
+for all i for some constant α 4 . Then the following holds in the infinite sample case (i.e. if at each
+iteration of AGGRE VAT E we collected an arbitrarily large amount of data by running the current
+policy):
+Theorem 2.1. After N iterations of AGGRE VAT E:
+                                                                                           
+                                                                             Qmax T log T
+                    J(π̂) ≤ J(π) ≤ J(π ∗ ) + T [ǫclass + ǫregret ] + O                          .
+                                                                                αN
+Thus if a no-regret online algorithm is used to pick the sequence of policies π̂1:N , then as the number
+of iterations N → ∞:
+                                    lim J(π) ≤ J(π ∗ ) + T ǫclass
+                                       N →∞
+
+   4
+       The default parameter-free version of AGGRE VAT E corresponds to α = 1, using 00 = 1.
+
+
+                                                      4
+The proof of this result is presented in the Appendix. This theorem indicates that after sufficient
+iterations, AGGRE VAT E will find policies that perform the task nearly as well as the demonstrator
+if there are policies in Π that have small cost-sensitive classification regret on the aggregate dataset
+(i.e. policies with cost-sensitive classification loss not much larger than that of the bayes-optimal
+one on this dataset). Note that non-interactive supervised learning methods are unable to achieve a
+similar bound which degrades only linearly with T and the cost-sensitive classification regret. [24].
+The analysis above abstracts away the issue of action exploration and learning from finite data. These
+issues come into play in a sample complexity analysis. Such analyses depend on many factors such
+as the particular reduction and exploration method. When reductions of cost-sensitive classification
+to simpler regression/ranking/classification [5] problems are used, our results can directly relate the
+task performance of the learned policy to the performance on the simpler problem. To illustrate
+how such results may be derived, we provide a result for the special case where actions are explored
+uniformly at random and the reduction of cost-sensitive classification to regression is used.
+In particular, if ǫ̂regret denotes the empirical average online learning regret on the training regression
+examples collected over the iterations, and ǫ̂class denotes the empirical regression regret of the best
+regressor in the class on the aggregate dataset of regression examples when compared to the bayes-
+optimal regressor, we have that:
+Theorem 2.2. N iterations of AGGRE VAT E, collecting m regression examples (s, a, t, Q) per iter-
+ation, guarantees that with probability at least 1-δ:
+                                                                                            
+                                                                             Qmax T log T
+                            p      q                   p
+J(π̂) ≤ J(π) ≤ J(π ∗ ) + 2 |A|T ǫ̂class + ǫ̂regret + O( log(1/δ)/N m) + O                       .
+                                                                                    αN
+
+Thus if a no-regret online algorithm is used to pick the sequence of regressors Q̂1:N , then as the
+number of iterations N → ∞, with probability 1:
+                                                       p      p
+                              lim J(π) ≤ J(π ∗ ) + 2 |A|T ǫ̂class
+                                  N →∞
+
+
+The detailed proof is presented in the Appendix. This result demonstrates how the task perfor-
+mance of the learned policies may be related all the way down to the regret on the regression loss
+at predicting the observed cost-to-go during training. In particular, it relates task performance to the
+square root of the online learning regret, on this regression loss, and the regression regret of the best
+regressor in the class to the bayes-optimal regressor on this training data. 5
+
+2.5 Discussion
+
+AGGRE VAT E as a reduction: AGGRE VAT E can be interpreted as a regret reduction of imitation
+learning to no-regret online learning. 6 We present a statistical regret reduction, as here, performance
+is related directly to the online, cost-sensitive classification regret on the aggregate dataset. By
+minimizing cost-to-go, we obtain regret reduction, rather than a weaker error reduction as in [24]
+when simply minimizing immediate classification loss.
+Limitations: As just mentioned, in cases where the expert is much better than any policy in Π,
+the expert’s cost-to-go may be a very optimistic estimate of the true future cost after taking a certain
+action. The approach may fail to learn policies that perform well, even if policies that can perform
+the task (albeit not as well as the expert) exist in the policy class. Consider again the driving scenario,
+where one may choose one of two roads to reach a goal: a shorter route that involves driving on a
+very narrow road next to cliffs on either side, and a longer route which is safer and risks no cliff. If
+in this example, the expert takes the short route faster and no policy in the class Π can drive without
+falling on the narrow road, but there exists policies that can take the longer road and safely reach the
+    5
+      The appearance of the square root is particular to the use of this reduction to squared-loss regression
+and implies relative slow convergence to good performance. Other cost-sensitive classification reductions and
+regression losses (e.g. [17, 7]) do not introduce this square root and still allow efficient learning.
+    6
+      Unfortunately regret here has two different meanings common in the literature: the first is in the statistical
+sense of doing nearly as well as the Bayes-optimal predictor. [8] The second use is in the online, adversarial,
+no-regret sense of competing against any hypothesis on a particular sequence without statistical assumptions.
+[9]
+
+
+                                                         5
+goal, this algorithm would fail to find these policies. The reason for this is that, as we minimize cost-
+to-go of the expert, we would always favor policies that heads toward the shorter narrow road. But
+once we are on that road, inevitably at some point we will encounter a scenario where no policies
+in the class can predict the same low cost-to-go actions as the expert (i.e. making ǫ large in the
+previous guarantee). The end result is that we may learn a policy that takes the short narrow road
+and eventually falls off the cliff, in these pathological scenarios.
+
+Comparison to SEARN: AGGRE VAT E shares deep commonalities with SEARN but by provid-
+ing a reduction to online learning allows much more general schemes to update the policy at each
+iteration that may be more convenient or efficient rather than the particular stochastic mixing update
+of SEARN. These include deterministic ones that provide upper convex bounds on performance. In
+fact, SEARN may be thought as a particular case of AGGRE VAT E, where the policy class is the set
+of distributions over policies, and the online coordinate descent algorithm (Frank-Wolfe) of [13] is
+used to update the distribution over policies at each iteration. Both collect data in a similar fashion
+at each iteration by executing the current policy up to a random time and then collecting cost-to-go
+estimates for explored actions in the current state. A distinction is that SEARN collects cost-to-go
+of the current policy after execution of the random action, instead of the cost-to-go of the expert.
+Interestingly, SEARN is usually used in practice with the approximation of collecting cost-to-go of
+the expert [10], rather than the current policy. Our approach can be seen as providing a theoretical
+justification for what was previously a heuristic.
+
+
+3 Reinforcement Learning via No-Regret Policy Iteration
+
+A relatively simple modification of the above approach enables us to develop a family of sample-
+based approximate policy iteration algorithms. Conceptually, we make a swap: from executing
+the current policy and then switching to the expert to observe a cost-to-go; to, executing the expert
+policy while collecting cost-to-go of the learner’s current policy. We denote this family of algorithms
+No-Regret Policy Iteration NRPI and detail and analyze it below.
+This alternate has similar guarantees to the previous version, but may be preferred when no policy
+in the class is as good as the expert or when only a distribution of “important states” is available.
+In addition it can be seen to address a general model-free reinforcement learning setting where
+we simply have a state exploration distribution we can sample from and from which we collect
+examples of the current policy’s cost-to-go. This is similar in spirit to how Policy Search by Dynamic
+Programming (PSDP) [4, 28] proceeds, and in some sense, the algorithm we present here provides a
+generalization of PSDP. However, by learning a stationary policy instead of a non-stationary policy,
+NRPI can generalize across time-steps and potentially lead to more efficient learning and practical
+implementation in problems where T is large or infinite.
+Following [4, 15] we assume access to a state exploration distribution νt for all times t in 1, 2, . . . , T .
+As will be justified by our theoretical analysis, these state exploration distributions should ideally
+be (close to) that of a (near-)optimal policy in the class Π. In the context where an expert is present,
+then this may simply be the distribution of states induced by the expert policy, i.e. νt = dtπ∗ . In
+general, this may be the state distributions induced by some base policy we want to improve upon,
+or be determined from prior knowledge of the task.
+Given the exploration distributions ν1:T , NRPI proceeds as follows. At each iteration n, it collects
+cost-to-go examples by sampling uniformly a time t ∈ {1, 2, . . . , T }, sampling a state st from νt ,
+and then executes an exploration action a in st followed by execution of the current learner’s policy
+πn for time t + 1 to T , to obtain a cost-to-go estimate (s, a, t, Q) of executing a followed by πn in
+state s at time t. 7 Multiple cost-to-go estimates are collected this way and added in dataset Dn .
+After enough data has been collected, we update the learner’s policy, to obtain πn+1 , using any no-
+regret online learning procedure, on the loss defined by the cost-sensitive classification examples in
+the new data Dn . This is iterated for a large number of iterations N . Initially, we may start with π1
+to be any guess of a good policy from the class Π, or use the expert’s cost-to-go at the first iteration,
+to avoid having to specify an initial policy. This algorithm is detailed in Algorithm 2.
+
+   7
+     In the particular case where νt = dtπ of an exploration policy π, then to sample st , we would simply
+execute π from time 1 to t − 1, starting from the initial state distribution.
+
+
+                                                      6
+Algorithm 2 NRPI Algorithm
+  Initialize D ← ∅, π̂1 to any policy in Π.
+  for i = 1 to N do
+     Collect m data points as follows:
+     for j = 1 to m do
+        Sample uniformly t ∈ {1, 2, . . . , T }.
+        Sample state st from exploration distribution νt .
+        Execute some exploration action at in current state st at time t
+        Execute π̂i from time t + 1 to T , and observe estimate of cost-to-go Q̂ starting at time t
+     end for
+     Get dataset Di = {(s, a, t, Q̂)}
+                                    S of states, actions, time, with current policy’s cost-to-go.
+     Aggregate datasets: D ← D Di .
+     Train cost-sensitive classifier π̂i+1 on D (Alternately: use any online learner on the data-sets
+     Di in sequence to get π̂i+1 )
+  end for
+  Return best π̂i on validation.
+
+
+3.1 Analysis
+
+Consider the loss function Ln given to the online learning algorithm within NRPI at iteration n.
+Assuming infinite data, it assigns the following loss to each policy π ∈ Π:
+                              Ln (π) = Et∼U(1:T ),s∼νt [Qπ̂Tn−t+1 (s, π)].
+This loss represents the expected cost-to-go of executing π immediately for one step followed by
+current policy π̂n , under the exploration distributions ν1:T .
+This sequence of losses over the iterations of training corresponds to an online cost-sensitive classi-
+fication problem, as in the previous AGGRE VAT E algorithm. Let ǫregret be the average regret of the
+online learner on this online cost-sensitive classification problem after N iterations of NRPI:
+                                           N                    N
+                                        1 X                  1 X
+                            ǫregret =         Li (πi ) − min       Li (π).
+                                        N i=1            π∈Π N
+                                                               i=1
+
+
+For any policy π ∈ Π, denote the average L1 or variational distance between νt and dtπ over time
+                       PT
+steps t as D(ν, π) = T1 t=1 ||νt − dtπ ||1 . Note that if νt = dtπ for all t, then D(ν, π) = 0.
+Denote by Qmax a bound on cost-to-go (which is always ≤ T Cmax ). Denote π̂ the best policy found
+by NRPI over iterations, and π the uniform mixture policy over π1:N defined as before. Then NRPI
+achieves the following guarantee:
+Theorem 3.1. For any policy π ′ ∈ Π:
+                        J(π̂) ≤ J(π) ≤ J(π ′ ) + T ǫregret + T QmaxD(ν, π ′ )
+If a no-regret online cost-sensitive classification algorithm is used: limN →∞ J(π) ≤ J(π ′ ) +
+T QmaxD(ν, π ′ )
+
+NRPI thus finds policies that are as good as any other policy π ′ ∈ Π whose state distribution dtπ′
+is close to νt on average over time t. Importantly, if ν1:T corresponds to the state distribution of
+an optimal policy in class Π, then this theorem guarantees that NRPI will find an optimal policy
+(within the class Π) in the limit.
+This theorem provides a similar performance guarantee to the results for PSDP presented in [4].
+NRPI has the advantage of learning a single policy for test execution instead one at each time allow-
+ing for improved generalization and more efficient learning. NRPI imposes stronger requirements:
+it uses a no-regret online cost-sensitive classification procedure instead of simply a cost-sensitive
+supervised learner. For finite policy classes Π, or using reductions of cost-sensitive classification
+as mentioned previously, we may still obtain convex online learning problems for which efficient
+no-regret strategies exist or use the simple aggregation of data-sets with any sufficiently stable batch
+learner. [23, 27]
+
+                                                    7
+The result presented here can be interpreted as a reduction of model-free reinforcement learning to
+no-regret online learning. It is a regret reduction, as performance is related directly to the online re-
+gret at the cost-sensitive classification task. However performance is strongly limited by the quality
+of the exploration distribution. 8
+
+
+4 Discussion and Future Work
+
+Contribution. The work here provides theoretical support for two seemingly unrelated empirical
+observations. First, and perhaps most crucially, much anecdotal evidence suggests that approximate
+policy iteration– and especially online variants [29]– is more effective and stable than theory and
+counter-examples to convergence might suggest. This cries out for some explanation; we contend
+that it can be understood as such online algorithms often enjoy no-regret guarantees or share similar
+stability properties than can ensure relative performance guarantees.
+Similarly, practical implementation of imitation learning-for-structured-prediction methods like
+SEARN rely on what was previously considered a heuristic of using the expert demonstrator as an es-
+timate of the future cost-to-go. The resulting good performance can be understood as a consequence
+of this heuristic being a special case of AGGRE VAT E where the online Frank-Wolfe algorithm [13]
+is used to choose policies. Moreover, stochastic mixing is but one of several approaches to achieving
+good online performance and deterministic variants have proven more effective in practice. [25]
+The resulting algorithms make suggestions for batch approaches as well: they suggest, for instance,
+that approximate policy iteration procedures (as well as imitation learning ones) are likely to be
+more stable and effective if they train not only on the cost-to-go of the most recent policy but also on
+previous policies. At first this may seem counter-intuitive, however, it prevents the oscillations and
+divergences that at times plague batch approximate dynamic programming algorithms by ensuring
+that each learned policy is good across many states.
+From a broad point of view, this work forms a piece of a growing picture that online algorithms and
+no-regret analyses– in contrast with the traditional i.i.d. or batch analysis– are important for under-
+standing learning with application to control and decision making [26, 22, 25, 24]. At first glance,
+online learning seems concerned with a very different adversarial setting. By understanding these
+methods as attempting to ensure both good performance and robust, stable learning across iterations
+[23, 27], they become a natural tool for understanding the dynamics of interleaving learning and
+execution when our primary concern is generalization performance.
+Limitations. It is important to note that any method relying on cost-to-go estimates can be im-
+practical as collecting each estimate for a single state-action pair may involve executing an entire
+trajectory. In many settings, minimizing imitation loss with DAGGER [24], is more practical as we
+can observe the action chosen by the expert in every visited state along a trajectory and thus collect
+T data points per trajectory instead of single one. This is less crucial in structured prediction settings
+where the cost-to-go of the expert may often be quickly computed which has lead to the success of
+the heuristic analyzed here. A potential combination of the two approaches, where first simple im-
+itation loss minimization provides a reasonable policy, and then this is refined using AGGRE VAT E
+(e.g. through additional gradient descent steps) thus using fewer (expensive) iterations.
+In the reinforcement learning setting, the bound provided is as strong as that provided by [4, 16] for
+an arbitrary policy class. However, as T Qmax is generally O(T 2 ), this only provides meaningful
+guarantees when dtπ′ is very close to νt (on average over time t). Previous methods like [4, 15, 28]
+provide a much stronger, multiplicative error guarrantee when we consider competing against the
+bayes optimal policy in a fully observed MDP. It is not obvious how the current algorithm and
+analysis can extend to that variant of the bound.
+Future Work. Much work remains to be done: there are a wide variety of no-regret learners and
+their practical trade-offs are almost completely open. Future work must explore this set to identify
+which methods are most effective in practice.
+    8
+      One would naturally consider adapting the exploration distributions ν1:T over the iterations of training.
+                          i
+It can be shown that if ν1:T  are the exploration distributions at iteration i, and we have a mechanism for
+          i
+making ν1:T  converge to the state distributions of an optimal policy in Π as i → ∞, then we would always be
+guaranteed to find an optimal policy in Π. Unfortunately, no known method can guarantee this.
+
+
+                                                      8
+References
+ [1] B. D. Argall, S. Chernova, M. Veloso, and B. Browning. A survey of robot learning from demonstration.
+     Robotics and Autonomous Systems, 2009.
+ [2] P. Auer, N. Cesa-Bianchi, Y. Freund, and R.E. Schapire. The nonstochastic multiarmed bandit problem.
+     SIAM Journal on Computing, 2002.
+ [3] O. Avner, S. Mannor, and O. Shamir. Decoupling exploration and exploitation in multi-armed bandits. In
+     ICML, 2012.
+ [4] J. A. Bagnell, A. Y. Ng, S. Kakade, and J. Schneider. Policy search by dynamic programming. In
+     Advances in Neural Information Processing Systems, 2003.
+ [5] A. Beygelzimer, V. Dani, T. Hayes, J. Langford, and B. Zadrozny. Error limiting reductions between
+     classification tasks. In ICML, 2005.
+ [6] A. Beygelzimer, J. Langford, L. Li, L. Reyzin, and R. E. Schapire. Contextual bandit algorithms with
+     supervised learning guarantees. In AISTATS, 2011.
+ [7] A. Beygelzimer, J. Langford, and P. Ravikumar. Error-correcting tournaments. In ALT, 2009.
+ [8] A. Beygelzimer, J. Langford, and B. Zadrozny. Machine learning techniquesreductions between predic-
+     tion quality metrics. In Performance Modeling and Engineering, pages 3–28. Springer US, 2008.
+ [9] N. Cesa-Bianchi and G. Lugosi. Prediction, learning, and games. Cambridge University Press, 2006.
+[10] H. Daumé III, J. Langford, and D. Marcu. Search-based structured prediction. Machine Learning, 2009.
+[11] M. Dudik, J. Langford, and L. Li. Doubly robust policy evaluation and learning. In ICML, 2011.
+[12] F. Duvallet, T. Kollar, and A. Stentz. Imitation learning for natural language direction following through
+     unknown environments. In ICRA, 2013.
+[13] E. Hazan and S. Kale. Projection-free online learning. In Proceedings of the 29th International Confer-
+     ence on Machine Learning (ICML-12), pages 521–528, 2012.
+[14] D. G. Horvitz and D. J. Thompson. A generalization of sampling without replacement from a finite
+     universe. Journal of American Statistics Association, 1952.
+[15] S. Kakade and J. Langford. Approximately optimal approximate reinforcement learning. In Proceedings
+     of the 19th International Conference on Machine Learning (ICML), 2002.
+[16] S. M. Kakade. On the sample complexity of reinforcement learning. PhD thesis, University College
+     London, 2003.
+[17] J. Langford and A. Beygelzimer. Sensitive error correcting output codes. In COLT, 2005.
+[18] L. Li, W. Chu, J. Langford, and R. E. Schapire. A contextual-bandit approach to personalized news article
+     recommendation. In WWW, 2010.
+[19] P. Mineiro. Error and regret bounds for cost-sensitive multiclass classification reduction to regression,
+     2010.
+[20] D. Munoz, J. A. Bagnell, and M. Hebert. Stacked hierarchical labeling. In ECCV, 2010.
+[21] S. Ross and J. A. Bagnell. Efficient reductions for imitation learning. In AISTATS, 2010.
+[22] S. Ross and J. A. Bagnell. Agnostic system identification for model-based reinforcement learning. In
+     ICML, 2012.
+[23] S. Ross and J. A. Bagnell. Stability conditions for online learnability. In Under Review. 15th International
+     Conference on Artificial Intelligence and Statistics (AISTATS), 2012.
+[24] S. Ross, G. J. Gordon, and J. A. Bagnell. A reduction of imitation learning and structured prediction to
+     no-regret online learning. In AISTATS, 2011.
+[25] S. Ross, D. Munoz, M. Hebert, and J. A. Bagnell. Learning message-passing inference machines for struc-
+     tured prediction. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition
+     (CVPR), 2011.
+[26] S. Ross, J. Zhou, Y. Yue, D. Dey, and J. A. Bagnell. Learning policies for contextual submodular predic-
+     tion. In ICML, 2013.
+[27] Ankan Saha, Prateek Jain, and Ambuj Tewari. The interplay between stability and regret in online learn-
+     ing. arXiv preprint arXiv:1211.6158, 2012.
+[28] Bruno Scherrer. Approximate policy iteration schemes: A comparison. In Proceedings of the Interna-
+     tional Conference on Machine Learning, 2014.
+[29] R. Sutton. The right way to do reinforcement learning with function approximation. In Approximate
+     the Policy or the Value Function: Reinforcement Learning Workshop at Neural Information Processing
+     Systems (NIPS), 2000.
+
+
+                                                       9
+Appendix: Proofs and Detailed Bounds
+In this appendix, we provide the proofs and detailed analysis of the algorithms for imitation learning and
+reinforcement learning provided in the main document.
+
+
+Lemmas
+We begin with a classical and useful general lemma that is needed for bounding the expected loss under different
+distributions. This will be used several times throughout. Here this will be useful for bounding the expected loss
+under the state distribution of π̂ (which optional queries the expert a fraction of the time during it’s execution)
+in terms of the expected loss under the state distribution of πi :
+Lemma 4.1. Let P and Q be any distribution over elements x ∈ X , and f : X → R, any bounded function
+such that f (x) ∈ [a, b] for all x ∈ X . Let the range r = b − a. Then |Ex∼P [f (x)] − Ex∼Q [f (x)]| ≤
+r
+2
+  ||P − Q||1
+
+
+Proof. We provide the proof for X discrete, a similar argument can be carried for X continuous, using integrals
+instead of sums.
+                                      |Ex∼PP[f (x)] − Ex∼Q [f (x)]|
+                                      = | Px P (x)f (x) − Q(x)f (x)|
+                                      = | x f (x)(P (x) − Q(x))|
+                                       P              P
+Additionally, since for any real c ∈ R, x P (x)c = x Q(x)c, then we have for any c:
+                                    P
+                                   | x fP(x)(P (x) − Q(x))|
+                                   = P | x (f (x) − c)(P (x) − Q(x))|
+                                   ≤     x |f (x) − c||P P
+                                                         (x) − Q(x)|
+                                   ≤ maxx |f (x) − c| x |P (x) − Q(x)|
+                                   = maxx |f (x) − c|||P − Q||1
+
+This holds for all c ∈ R. This upper bound is minimized for c = a + r2 , making maxx |f (x) − c| ≤ r2 . This
+proves the lemma.
+
+
+The L1 distance between the distribution of states encountered by π̂i , the policy chosen by the online learner,
+and πi , the policy used to collect data that continues to execute the expert’s actions with probability βi is
+bounded as follows:
+Lemma 4.2. ||dπi − dπ̂i ||1 ≤ 2 min(1, T βi ).
+
+
+Proof. Let d the distribution of states over T steps conditioned on πi picking the expert π ∗ at least once over T
+steps. Since πi always executes π̂i (never executes the expert action) over T steps with probability (1 − βi )T
+we have dπi = (1 − βi )T dπ̂i + (1 − (1 − βi )T )d. Thus
+
+                                          ||dπi − dπ̂i ||1
+                                          = (1 − (1 − βi )T )||d − dπ̂i ||1
+                                          ≤ 2(1 − (1 − βi )T )
+                                          ≤ 2T βi
+
+The last inequality follows from the fact that (1 − β)T ≥ 1 − βT for any β ∈ [0, 1]. Finally, since for any 2
+distributions p, q, we always have ||p − q||1 ≤ 2, then ||dπi − dπ̂i ||1 ≤ 2 min(1, T βi ).
+
+
+Below we use the performance difference lemma [4, 15, 16] that is useful to bound the change in total cost-to-
+go. This general result bounds the difference in performance of any two policies. We present this results and
+its proof here for completeness.
+Lemma 4.3. Let π and π ′ be any two policy and denote Vt′ and Q′t the t-step value function and Q-value
+function of policy π ′ respectively, then:
+
+                         J(π) − J(π ′ ) = T           E           [Q′T −t+1 (s, π) − VT′ −t+1 (s)]
+                                               t∼U (1:T ),s∼dtπ
+
+
+for U (1 : T ) the uniform distribution on the set {1, 2, . . . , T }.
+
+
+                                                            10
+Proof. Let πt denote the non-stationary policy that executes π in the first t time steps, and then switches to
+execute π ′ at time t + 1 to T . Then we have J(π) = J(πT ) and J(π ′ ) = J(π0 ). Thus:
+                             J(π) − J(π ′ )
+                                 PT
+                             =         [J(πt ) − J(πt−1 )]
+                                 Pt=1
+                                   T             ′                 ′
+                             =     t=1 [Es∼dtπ [QT −t+1 (s, π) − VT −t+1 (s)]]
+                             = T Et∼U (1:T ),s∼dtπ [QT −t+1 (s, π) − VT′ −t+1 (s)]
+                                                     ′
+
+
+
+
+AGGRE VAT E Reduction Analysis
+                         PN                          ∗                        ∗
+Let ǫclass = minπ∈Π N1      i=1 Et∼U (1:T ),s∼dtπi [QT −t+1 (s, π) − mina QT −t+1 (s, a)] denote the minimum
+expected cost-sensitive classification regret achieved by policies in the class Π on all the data over the N it-
+erations of training. Denote the online learning average regret on the cost-to-go examples of the sequence
+                                                                                 PN
+of policies chosen by AGGRE VAT E , ǫregret = N1 [ N
+                                                       P
+                                                          i=1 ℓi (π̂i ) − minπ∈Π   i=1 ℓi (π)], where ℓi (π) =
+                    ∗                                                         ∗
+Et∼U (1:T ),s∼dtπ [QT −t+1 (s, π)]. Assume the cost-to-go of the expert Q is non-negative and bounded by
+                i
+Q∗max , and that βi are chosen such that βi ≤ (1 − α)i−1 for some α. Then we have the following:
+Theorem 4.4. After N iterations of AGGRE VAT E :
+                                                                              Q∗max T log T
+                                                                                             
+                     J(π̂) ≤ J(π) ≤ J(π ∗ ) + T [ǫclass + ǫregret ] + O                           .
+                                                                                  αN
+Thus if a no-regret online algorithm is used to pick the sequence of policies π̂1:N , then as the number of
+iterations N → ∞:
+                                        lim J(π) ≤ J(π ∗ ) + T ǫclass
+                                             N→∞
+
+
+Proof. For every policy π̂i , we have:
+               J(π̂i ) − J(π ∗ )
+               = T Et∼U (1:T ),s∼dt [Q∗T −t+1 (s, π̂i ) − VT∗−t+1 (s)]
+                                     π̂i
+                    PT               ∗                    ∗
+               =       t=1 Es∼dtπ̂ [QT −t+1 (s, π̂i ) − VT −t+1 (s)]
+                    PT            i
+                           Es∼dtπ [Q∗T −t+1 (s, π̂i ) − VT∗−t+1 (s)] + Q∗max Tt=1 ||dtπi − dtπ̂i ||1
+                                                                              P
+               ≤
+                    Pt=1
+                       T
+                                  i
+                                     ∗                    ∗               ∗   PT
+               ≤       t=1 Es∼dtπi [QT −t+1 (s, π̂i ) − VT −t+1 (s)] + 2Qmax    t=1 min(1, tβi )
+                    PT               ∗                    ∗                 ∗
+               ≤       t=1 Es∼dtπi [QT −t+1 (s, π̂i ) − VT −t+1 (s)] + 2T Qmax min(1, T βi )
+               = T Et∼U (1:T ),s∼dtπ [Q∗T −t+1 (s, π̂i ) − VT∗−t+1 (s)] + 2T Q∗max min(1, T βi )
+                                         i
+
+where we use lemma 4.3 in the first equality, lemma 4.1 in the first inequality, and a similar argument to lemma
+4.2 for the second inequality.
+Since βi are non-increasing, define nβ the largest n ≤ N such that βn > 1/T . Then:
+         J(π) − J(π ∗ )
+                PN
+         = N1         [J(π̂i ) − J(π ∗ )]
+                Pi=1
+                  N
+         ≤ N i=1 [T Et∼U (1:T ),s∼dtπ [Q∗T −t+1 (s, π̂i ) − VT∗−t+1 (s)] + 2T Q∗max min(1, T βi )]
+             1
+                            PN             i
+                                                         ∗                ∗
+         = T [minπ∈Π N1         i=1 Et∼U (1:T ),s∼dtπi [QT −t+1 (s, π) − VT −t+1 (s)]] + T ǫregret
+                   ∗
+               2T Q
+             + Nmax [nβ + T N
+                                  P
+                                             βi ]
+                            PN i=nβ +1
+         ≤ T [minπ∈Π N i=1 Et∼U (1:T ),s∼dtπ [Q∗T −t+1 (s, π) − mina Q∗T −t+1 (s, a)] + T ǫregret
+                         1
+                                                     i
+               2T Q∗
+             + Nmax [nβ + T N
+                                  P
+                                     i=nβ +1 βi ]
+                                  2T Q∗
+                                           [nβ + T N
+                                                     P
+         = T ǫclass + T ǫregret +                       i=nβ +1 βi ]
+                                       max
+                                      N
+
+                                                                                                 PN
+Again, J(π̂) ≤ J(π) since the minimum is always better than the average, i.e. mini J(π̂i ) ≤ N1     i=1 J(π̂i ).
+Finally, we have that when βi = (1 − α)i−1 , [nβ + T N                 log(T )+2
+                                                    P
+                                                       i=nβ +1  βi ] ≤     α
+                                                                                 . This proves the first part of
+the theorem.
+The
+   second  part follows immediately from the fact that ǫregret → 0 as N → ∞, and similarly for the extra term
+    Q∗
+     max T log T
+O       αN
+                   .
+
+
+                                                        11
+Finite Sample AGGRE VAT E with Q-function approximation
+
+We here consider the finite sample case where actions are explored uniformly randomly and the reduction
+of cost-sensitive classification to squared loss regression is used. We consider learning an estimate Q-value
+function Q̂ of the expert’s cost-to-go, and we consider a general case where the cost-to-go predictions may
+depend on features f (s, a, t) of the state s, action a and time t, e.g. Q̂ could be a linear regressor s.t.
+Q̂T −t+1 (s, a) = w⊤ f (s, a, t) is the estimate of the cost-to-go Q∗T −t+1 (s, a), and w are the parameters of
+the linear regressor we learn. Given such estimates Q̂, we consider executing the policy π̂, such that in state s
+at time t, π̂(s, t) = mina∈A Q̂T −t+1 (s, a).
+Theorem 4.5. After N iterations of AGGRE VAT E , collecting m regression examples (s, a, t, Q) per iteration,
+guarantees that with probability at least 1-δ:
+                                                                                                                  
+                                                                                                    Qmax T log T
+                                    q
+     J(π̂) ≤ J(π) ≤ J(π ∗ ) + 2 |A|T ǫ̂class + ǫ̂regret + O( log(1/δ)/N m) + O
+                               p                            p
+                                                                                                                       .
+                                                                                                       αN
+
+Thus if a no-regret online algorithm is used to pick the sequence of regressors Q̂1:N , then as the number of
+iterations N → ∞, with probability 1:
+
+                                          lim J(π) ≤ J(π ∗ ) + 2 |A|T ǫ̂class
+                                                                p    p
+                                          N→∞
+
+
+
+
+Proof. Consider π̃, the bayes-optimal non-stationary policy that minimizes loss on the cost-to-go examples.
+That is, π̃(s, t) = mina∈A Q∗T −t+1 (s, a), i.e. it picks the action with minimum expected expert cost-to-go
+conditioned on being in state s and time t. Additionally, given the observed noisy Q-values from each trajectory,
+the bayes-optimal regressor is simply the Q-value function Q∗ of the expert that predicts the expected cost-to-
+go.
+At each iteration i, we execute a policy π̂i , such that π̂i (s, t) = arg mina∈A Q̂iT −t+1 (s, a), where Q̂i is the
+current regressor at iteration i from the base online learner. The cost-sensitive regret of policy π̂i , compared to
+π̃, can be related to the regression regret of Q̂i as follows:
+Consider any state s and time t. Let âi = π̂i (s, t) and consider the action a′ of any other policy. We have that:
+
+
+ Q∗T −t+1 (s, âi ) − Q∗T −t+1 (s, a)
+ ≤ Q̂iT −t+1 (s, âi ) − Q̂iT −t+1 (s, a′ ) + Q∗T −t+1 (s, âi ) − Q̂iT −t+1 (s, âi ) + Q̂iT −t+1 (s, a′ ) − Q∗T −t+1 (s, a′ )
+ ≤ Q∗T −t+1 (s, âi ) − Q̂iT −t+1 (s, âi ) + Q̂iT −t+1 (s, a′ ) − Q∗T −t+1 (s, a′ )
+ ≤ 2 maxa∈A |Q∗T −t+1 (s, a) − Q̂iT −t+1 (s, a)|
+
+
+Additionally, for any joint distribution D over (s, t), and U (A) the uniform distribution over actions, we have
+that:
+
+
+                           (E(s,t)∼D [maxa∈A |Q∗T −t+1 (s, a) − Q̂iT −t+1 (s, a)|])2
+                           ≤ E(s,t)∼D [maxa∈A |Q∗T −t+1 (s, a) − Q̂iT −t+1 (s, a)|2 ]
+                           ≤ E(s,t)∼D [ a∈A |Q∗T −t+1 (s, a) − Q̂iT −t+1 (s, a)|2 ]
+                                        P
+
+                           = |A|E(s,t)∼D,a∼U (A) [|Q∗T −t+1 (s, a) − Q̂iT −t+1 (s, a)|2 ]
+
+
+Thus we obtain that for every π̂i :
+
+
+                   Et∼U (1:T ),s∼dtπ [Q∗T −t+1 (s, π̂i ) − Q∗T −t+1 (s, π̃)]
+                                      i
+                   ≤    2 Et∼U (1:T ),s∼dtπ [maxa∈A |Q∗T −t+1 (s, a) − Q̂iT −t+1 (s, a)|]
+                                           i
+                         p q
+                   ≤    2 |A| Et∼U (1:T ),s∼dtπ ,a∼U (A) [|Q∗T −t+1 (s, a) − Q̂iT −t+1 (s, a)|2 ]
+                                                     i
+
+
+
+Thus
+
+
+                                                            12
+    J(π) − J(π ∗ )
+        T
+           PN                          ∗                   ∗           ∗
+    = N       i=1 Et∼U (1:T ),s∼dtπ̂ [QT −t+1 (s, π̂i ) − QT −t+1 (s, π )]
+                                    i
+              N                                                               2T Q∗
+        T                              ∗                   ∗           ∗
+                                                                                        [nβ + T N
+           P                                                                                    P
+    ≤ N       i=1 Et∼U (1:T ),s∼dtπi [QT −t+1 (s, π̂i ) − QT −t+1 (s, π )] +                      i=n +1 βi ]
+                                                                                    max
+                                                                                  N
+        T
+           PN                          ∗                   ∗
+                                                                                  ∗
+                                                                             2T Qmax            PN β
+    ≤ N i=1 Et∼U (1:T ),s∼dtπ [QT −t+1 (s, π̂i ) − QT −t+1 (s, π̃)] +           N
+                                                                                      [nβ + T i=nβ +1 βi ]
+         √             q            i
+        2 |A|T PN
+    ≤      N       i=1    Et∼U (1:T ),s∼dtπ ,a∼U (A) [|Q∗T −t+1 (s, a) − Q̂iT −t+1 (s, a)|2 ]
+                                            i
+          2T Q∗
+        + Nmax [nβ + T N
+                             P
+                               i=nβ +1 βi ]
+                 q P
+                         N
+    ≤ 2 |A|T N1
+         p
+                                                             ∗                  i             2
+                         i=1 Et∼U (1:T ),s∼dtπi ,a∼U (A) [|QT −t+1 (s, a) − Q̂T −t+1 (s, a)| ]
+               ∗
+          2T Qmax            PN
+        + N [nβ + T i=nβ +1 βi ]
+
+
+Now in state s at time t, when performing a and then following the expert, consider the distribution ds,a,t over
+observed cost-to-go Q, such that EQ∼ds,a,t [Q] = Q∗T −t+1 (s, a).
+
+For any regressor Q̂, define the expected squared loss in predictions of the observed cost-to-go at iteration i
+as ℓi (Q̂) = Et∼U (1:T ),s∼dtπ ,a∼U (A),Q∼ds,t,a [|Q − Q̂T −t+1 (s, a)|2 ]. Then since for any random variable X
+                                i
+with mean µ, if we have an estimate µ̂ of the mean, |µ̂ − µ|2 = Ex [(x − µ̂)2 − (x − µ)2 ], we have that:
+
+          N                                                                           N
+       1 X                                                                         1 X
+             Et∼U (1:T ),s∼dtπ ,a∼U (A) [|Q∗T −t+1 (s, a) − Q̂iT −t+1 (s, a)|2 ] =       ℓi (Q̂i ) − ℓi (Q∗ )
+       N i=1                  i                                                    N i=1
+
+Now, in the finite sample case, consider collecting m samples at each iteration i: {(sij , aij , tij , Qij )}m
+                                                                                                             j=1 . The
+                                                     1
+                                                        Pm                                     2
+expected squared loss ℓi is estimated as ℓ̂i (Q̂) = m    j=1 (Q̂T −tij +1 (sij , aij ) − Qij ) , and the no-regret
+algorithm is run on the estimated loss ℓ̂i .
+Define Yi,j = ℓi (Q̂i ) − (Q̂iT −tij +1 (sij , aij ) − Qij )2 − ℓi (Q∗ ) + (Q∗T −tij +1 (sij , aij ) − Qij )2 , the dif-
+ference between the expected squared loss and the empirical square loss at each sample for both Q̂i and Q∗ .
+Conditioned on previous trajectories, each Yi,j has expectation 0. Then the sequence of random variables
+Xkm+l = ki=1 m
+           P      P              Pl
+                     j=1 Yi,j +     j=1 Y(k+1),j , for k ∈ {0, 1, 2, . . . , N − 1} and l ∈ {1, 2, . . . , m}, forms a
+martingale, and if the squared loss at any sample is bounded by ℓmax , we obtain that |Xi − Xi+1 | ≤       q2ℓmax . By
+                                                                                  1                                      2 log(1/δ)
+Azuma-Hoeffding’s inequality, this implies that with probability at least 1 − δ, Nm XNm ≤ 2ℓmax                              Nm
+                                                                                                                                    .
+                                                                                                   PN            i
+Denote the empirical average online regret on the training squared loss ǫ̂regret = N1                 i=1 ℓ̂i (Q̂ ) −
+          1
+            P  N                   ∗
+minQ̂∈Q N i=1 ℓ̂i (Q̂). Let Q̃ be the bayes-optimal regressor on the finite training data, and define the
+                                                                                       PN                      ∗
+empirical regression regret of the best regressor in the class as ǫ̂class = minQ̂∈Q N1  i=1 [ℓ̂i (Q̂) − ℓ̂i (Q̃ )].
+
+Then we obtain that with probability at least 1 − δ:
+
+                           PN
+                       1
+                       N    i=1 ℓi (Q̂i ) − ℓi (Q∗ )
+                            1
+                              PN              i             ∗      1
+                       =    N    i=1 ℓ̂i (Q̂ ) − ℓ̂i (Q ) + Nm Xq        Nm
+                            1
+                              PN              i             ∗              2 log(1/δ)
+                       ≤    N    i=1 iℓ̂ ( Q̂   ) − ℓ̂ i (Q   ) + 2ℓ max       Nm                 q
+                                          PN                          ∗                                 2 log(1/δ)
+                       ≤   minQ̂∈Q N1        i=1 [ℓ̂i (q
+                                                       Q̂) − ℓ̂i (Q       )] + ǫ̂regret + 2ℓmax             Nm
+                                                         2 log(1/δ)
+                       ≤   ǫ̂class + ǫ̂regret + 2ℓmax        Nm
+
+                                                           PN                ∗
+                                                                                      PN            ∗
+where the last inequality follows from the fact that          i=1 ℓ̂i (Q̃        )≤    i=1 ℓ̂i (Q       ).
+Combining with the above, we obtain that with probability at least 1 − δ:
+
+                                     s
+                                                                                                           N
+                                                                     r
+                   ∗
+                      p                                                    2 log(1/δ)   2T Q∗max           X
+      J(π) − J(π ) ≤ 2 |A|T             ǫ̂class + ǫ̂regret + 2ℓmax                    +          [nβ + T        βi ]
+                                                                               Nm          N             i=n +1      β
+
+
+
+
+                                                              13
+NRPI Reduction Analysis
+We here provide the proof of the result for NRPI, sampled from state exploration distributions ν1:T .
+To analyze this version, we begin with an alternate version of the performance difference lemma (lemma 4.3)
+presented before:
+Lemma 4.6. Let π and π ′ be any two policy and denote Vt and Qt the t-step value function and Q-value
+function of policy π respectively, then:
+                       J(π) − J(π ′ ) = T       E        [VT −t+1 (s) − QT −t+1 (s, π ′ )]
+                                                t∼U (1:T ),s∼dt ′
+                                                              π
+
+for U (1 : T ) the uniform distribution on the set {1, 2, . . . , T }.
+
+Proof. By applying lemma 4.3 to J(π ′ ) − J(π), we obtain:
+                     J(π ′ ) − J(π) = T       E        [QT −t+1 (s, π ′ ) − VT −t+1 (s)]
+                                                t∼U (1:T ),s∼dt ′
+                                                              π
+
+This proves the lemma.
+
+Now denote the loss Ln used by the online learner at iteration n, s.t.:
+                                      Ln (π) = Et∼U (1:T ),s∼νt [Qπ̂Tn−t+1 (s, π)].
+and ǫregret the average regret after the N iterations of NRPI:
+                                                   N                    N
+                                                1 X                  1 X
+                                    ǫregret =         Li (πi ) − min       Li (π).
+                                                N i=1            π∈Π N
+                                                                       i=1
+
+
+For any policy π ∈ Π, denote the average L1 distance between νt and dtπ over time steps t as:
+                                                              T
+                                                          1 X
+                                            D(ν, π) =           ||νt − dtπ ||1 .
+                                                          T t=1
+
+Assume the cost-to-go of the learned policies π1 , π2 , . . . , πN are non-negative and bounded by Qmax , for any
+state s, action a and time t (in the worst case this is T Cmax ). Denote π̂ the best policy found by NRPI over the
+iterations, and π the uniform mixture policy over π1:N defined as before. Then we have to following guarantee
+with this version of NRPI with learner’s cost-to-go:
+Theorem 4.7. For any π ′ ∈ Π:
+                               J(π̂) ≤ J(π) ≤ J(π ′ ) + T ǫregret + T Qmax D(ν, π ′ )
+Thus, if a no-regret online cost-sensitive classification algorithm is used, then:
+                                      lim J(π) ≤ J(π ′ ) + T Qmax D(ν, π ′ )
+                                      N→∞
+
+
+Proof. Let Qit denote the t-step Q-value function of policy π̂i . Then for every π̂i we have:
+              J(π̂i ) − J(π ′ )
+              = T Et∼U (1:T ),s∼dt ′ [QiT −t+1 (s, π̂i ) − QiT −t+1 (s, π ′ )]
+                   PT                 π
+                                      i                   i           ′
+              =       t=1 Es∼dtπ ′ [QT −t+1 (s, π̂i ) − QT −t+1 (s, π )]
+                   PT               i                   i           ′          PT              t
+              ≤       t=1 Es∼νt [QT −t+1 (s, π̂i ) − QT −t+1 (s, π )] + Qmax      t=1 ||νt − dπ ′ ||1
+                                         i                   i           ′                   ′
+              = T Et∼U (1:T ),s∼νt [QT −t+1 (s, π̂i ) − QT −t+1 (s, π )] + T Qmax D(ν, π )
+where we use lemma 4.6 in the first equality, and lemma 4.1 in the first inequality.
+Thus:
+  J(π) − J(π ′ )
+         PN
+  = N1          [J(π̂i ) − J(π ′ )]
+         Pi=1
+           N
+  ≤ N i=1 [T Et∼U (1:T ),s∼νt [QiT −t+1 (s, π̂i ) − QiT −t+1 (s, π ′ )] + T Qmax D(ν, π ′ )]
+       1
+          PN                         i                            1
+                                                                    PN                         i
+  ≤ T N1      i=1 Et∼U (1:T ),s∼νt [QT −t+1 (s, π̂i )] − T minπ∈Π N     i=1 Et∼U (1:T ),s∼νt [QT −t+1 (s, π)]
+                         ′
+      +T Qmax D(ν, π )
+  = T ǫregret + T Qmax D(ν, π ′ )
+                                                                                                        PN
+Again, J(π̂) ≤ J(π) since the minimum is always better than the average, i.e. mini J(π̂i ) ≤ N1          i=1 J(π̂i ).
+This proves the first part of the theorem.
+The second part follows immediately from the fact that ǫregret → 0 as N → ∞.
+
+
+
+                                                             14
+

@@ -1,0 +1,648 @@
+                                   Deeply AggreVaTeD:
+                Differentiable Imitation Learning for Sequential Prediction
+
+
+            Wen Sun 1 Arun Venkatraman 1 Geoffrey J. Gordon 2 Byron Boots 3 J. Andrew Bagnell 1
+
+
+                        Abstract                                optimize for a loss acquired only after many predictions.
+     Recently, researchers have demonstrated state-             Although conventional supervised learning of deep mod-
+     of-the-art performance on sequential prediction            els has been pivotal in advancing performance in sequen-
+     problems using deep neural networks and Re-                tial prediction problems, researchers are beginning to uti-
+     inforcement Learning (RL). For some of these               lize Reinforcement Learning (RL) methods to achieve even
+     problems, oracles that can demonstrate good per-           higher performance (Ranzato et al., 2015; Bahdanau et al.,
+     formance may be available during training, but             2016; Li et al., 2016). In sequential prediction tasks, fu-
+     are not used by plain RL methods. To take ad-              ture predictions often depend on the history of previous
+     vantage of this extra information, we propose Ag-          predictions; thus, a poor prediction early in the sequence
+     greVaTeD, an extension of the Imitation Learn-             can lead to high loss (cost) for future predictions. Viewing
+     ing (IL) approach of Ross & Bagnell (2014).                the predictor as a policy ⇡, deep RL algorithms are able to
+     AggreVaTeD allows us to use expressive dif-                reason about the future accumulated cost in sequential pre-
+     ferentiable policy representations such as deep            diction problems. These approaches have dramatically ad-
+     networks, while leveraging training-time ora-              vanced the state-of-the-art on a number of problems includ-
+     cles to achieve faster and more accurate solu-             ing high-dimensional robotics control tasks and video and
+     tions with less training data. Specifically, we            board games (Schulman et al., 2015; Silver et al., 2016).
+     present two gradient procedures that can learn
+                                                                In contrast with general reinforcement learning methods,
+     neural network policies for several problems, in-
+                                                                imitation learning and related sequential prediction algo-
+     cluding a sequential prediction task and several
+                                                                rithms such as SEARN (Daumé III et al., 2009), DaD
+     high-dimensional robotics control problems. We
+                                                                (Venkatraman et al., 2015), AggreVaTe (Ross & Bagnell,
+     also provide a comprehensive theoretical study
+                                                                2014), and LOLS (Chang et al., 2015b) reduce the sequen-
+     of IL that demonstrates that we can expect up
+                                                                tial prediction problems to supervised learning by leverag-
+     to exponentially-lower sample complexity for
+                                                                ing a (near) optimal cost-to-go oracle that can be queried
+     learning with AggreVaTeD than with plain RL
+                                                                for the next (near)-best prediction at any point during train-
+     algorithms. Our results and theory indicate that
+                                                                ing. Specifically, these methods assume access to an ora-
+     IL (and AggreVaTeD in particular) can be a more
+                                                                cle that provides an optimal or near-optimal action and the
+     effective strategy for sequential prediction than
+                                                                future accumulated loss Q⇤ , the so-called cost-to-go. For
+     plain RL.
+                                                                robotics control problems, this oracle may be a human ex-
+                                                                pert guiding the robot during the training phase (Abbeel &
+                                                                Ng, 2004) or the policy from an optimal MDP solver (Ross
+1. Introduction                                                 et al., 2011; Kahn et al., 2016; Choudhury et al., 2017)
+A fundamental challenge in artificial intelligence, robotics,   that is either too slow to use at test time or leverages in-
+and language processing is sequential prediction: to reason,    formation unavailable at test time. For sequential predic-
+plan, and make a sequence of predictions or decisions to        tion problems, an oracle can be constructed by optimiza-
+minimize accumulated cost, achieve a long-term goal, or         tion (e.g., beam search) or by a clairvoyant greedy algo-
+                                                                rithm (Daumé III et al., 2009; Ross et al., 2013; Rhinehart
+   1
+     Robotics Institute, Carnegie Mellon University, USA        et al., 2015; Chang et al., 2015a) that, given the training
+2
+ Machine Learning Department, Carnegie Mellon University,       data’s ground truth, is near-optimal on the task-specific per-
+USA 3 College of Computing, Georgia Institute of Technology,    formance metric (e.g., cumulative reward, IoU, Unlabeled
+USA. Correspondence to: Wen Sun <wensun@cs.cmu.edu>.
+                                                                Attachment Score, BLEU).
+Proceedings of the 34 th International Conference on Machine        Expert, demonstrator, and oracle are used interchangeably.
+Learning, Sydney, Australia, PMLR 70, 2017. Copyright 2017
+by the author(s).
+                                    Differential Imitation Learning for Sequential Prediction
+
+We stress that the oracle is only required to be available        The differentiable nature of AggreVaTeD additionally al-
+during training. Therefore, the goal of IL is to learn a policy   lows us to employ Recurrent Neural Network policies, e.g.,
+ˆ with the help of the oracle (⇡ ⇤ , Q⇤ ) during the training
+⇡                                                                 Long Short-Term Memory (LSTM) (Hochreiter & Schmid-
+session, such that ⇡
+                   ˆ achieves similar or better performance       huber, 1997), to handle partially observable settings (e.g.,
+at test time when the oracle is unavailable. In contrast to       observe only partial robot state). Empirical results demon-
+IL, reinforcement learning methods often initialize with a        strate that by leveraging an oracle, IL can learn much faster
+random policy ⇡0 or cost-to-go estimate Q0 that may be far        than RL.
+from optimal. The optimal policy (or cost-to-go) must be
+                                                                  In addition to providing a set of practical algorithms, we
+found by exploring, often with random actions.
+                                                                  develop a comprehensive theoretical study of IL on dis-
+A classic family of IL methods is to collect data from run-       crete MDPs. We construct an MDP that demonstrates ex-
+ning the demonstrator or oracle and train a regressor or          ponentially better sample efficiency for IL than any RL al-
+classifier via supervised learning. These methods (Abbeel         gorithm. For general discrete MDPs, we provide a regret
+& Ng, 2004; Syed et al., 2008; Ratliff et al., 2006; Ziebart      upper bound for AggreVaTeD with WM, which shows IL
+et al., 2008; Finn et al., 2016; Ho & Ermon, 2016) learn          can learn dramatically faster than RL. We provide a regret
+either a policy ⇡ ˆ ⇤ or Q̂⇤ from a fixed-size dataset pre-       lower bound for any IL algorithm, which demonstrates that
+collected from the oracle. Unfortunately, these methods           AggreVaTeD with WM is near-optimal.
+exhibit a pernicious problem: they require the training and
+                                                                  To summarize the contributions of this work: (1) Aggre-
+test data to be sampled from the same distribution, despite
+                                                                  VaTeD allows us to handle continuous action spaces and
+the fact they explicitly change the sample policy during
+                                                                  employ recurrent neural network policies for Partially Ob-
+training. As a result, policies learned by these methods can
+                                                                  servable Markov Decision Processes (POMDPs); (2) un-
+fail spectacularly (Ross & Bagnell, 2010). Interactive ap-
+                                                                  derstanding IL from a perspective that is related to pol-
+proaches to IL such as SEARN (Daumé III et al., 2009),
+                                                                  icy gradient allows us to leverage advances from the well-
+DAgger (Ross et al., 2011), and AggreVaTe (Ross & Bag-
+                                                                  studied RL policy gradient literature (e.g., gradient vari-
+nell, 2014) interleave learning and testing to overcome the
+                                                                  ance reduction techniques, efficient natural gradient com-
+data mismatch issue and, as a result, work well in practi-
+                                                                  putation); (3) we provide a new sample complexity study
+cal applications. Furthermore, these interactive approaches
+                                                                  of IL and compare to RL, showing that we can expect up to
+can provide strong theoretical guarantees between training
+                                                                  exponentially lower sample complexity. Our experimental
+time loss and test time performance through a reduction to
+                                                                  and theoretical results support the proposition:
+no-regret online learning.
+In this work, we introduce AggreVaTeD, a differentiable                 Imitation Learning is a more effective strategy
+version of AggreVaTe (Aggregate Values to Imitate (Ross                 than Reinforcement Learning for sequential pre-
+& Bagnell, 2014)) which allows us to train policies with                diction with near-optimal cost-to-go oracles.
+efficient gradient update procedures. AggreVaTeD extends
+and scales interactive IL for use in sequential prediction        2. Preliminaries
+and challenging continuous robot control tasks. We pro-
+vide two gradient update procedures: a regular gradient           A Markov Decision Process consists of a set of states, ac-
+update developed from Online Gradient Descent (OGD)               tions (that come from a policy), cost (loss), and a model
+(Zinkevich, 2003) and a natural gradient update (Kakade,          that transitions states given actions. Interestingly, most
+2002; Bagnell & Schneider, 2003), which is closely re-            sequential prediction problems can be framed in terms
+lated to Weighted Majority (WM) (Littlestone & Warmuth,           of MDPs (Daumé III et al., 2009). The actions are the
+1994), a popular no-regret algorithm that enjoys an almost        learner’s (e.g., RNN’s) predictions. The state is then the re-
+dimension-free property (Bubeck et al., 2015).                    sult of all the predictions made so far (e.g., the dependency
+                                                                  tree constructed so far or the words translated so far). The
+AggreVaTeD leverages the oracle to learn rich polices that        cumulative cost is the performance metric such as (nega-
+can be represented by complicated non-linear function ap-         tive) UAS, received at the end (horizon) or after the final
+proximators. Our experiments with deep neural networks            prediction. For robotics control problems, the robot’s con-
+on various robotics control simulators and on a depen-            figuration is the state, the controls (e.g., joint torques) are
+dency parsing sequential prediction task show that Ag-            the actions, and the cost is related to achieving a task (e.g.,
+greVaTeD can achieve expert-level performance and even            distance walked).
+super-expert performance when the oracle is sub-optimal,
+a result rarely achieved by non-interactive IL approaches.        Formally, a finite-horizon Markov Decision Process (MDP)
+                                                                  is defined as (S, A, P, C, ⇢0 , H). Here, S is a set of S states
+    i.e., the regret bound depends on poly-log of the dimension
+                                                                  and A is a set of A actions; at time step t, Pt is the transition
+of parameter space.
+                                                                  dynamics such that for any st 2 S, st+1 2 S, at 2 A,
+                                                     Differential Imitation Learning for Sequential Prediction
+
+Pt (st+1 |st , at ) is the probability of transitioning to state                           is defined over the whole history of observations and ac-
+st+1 from state st by taking action at at step t; C is the                                 tions (ot is generated from the hidden state st ). We use
+cost distribution such that a cost ct at step t is sampled from                            both LSTM and Gated Recurrent Unit (GRU) (Chung et al.,
+Ct (·|st , at ). Finally, we denote c̄t (st , at ) as the expected                         2014) based policies where the RNN’s hidden states pro-
+cost, ⇢0 as the initial distribution of states, and H 2 N+ as                              vide a compressed feature of the history. To our best knowl-
+the finite horizon (max length) of the MDP.                                                edge, this is the first time RNNs are employed in an IL
+                                                                                           framework to handle partially observable environments.
+We define a stochastic policy ⇡ such that for any state
+s 2 S, ⇡(·|s) 2 (A), where (A) is a A-dimensional
+simplex, conditioned on state s. ⇡(a|s) 2 [0, 1] outputs the                               3. Differentiable Imitation Learning
+probability of taking action a at state s. The distribution of
+                                                                                           Policy based imitation learning aims to learn a policy ⇡   ˆ
+trajectories ⌧ = (s1 , a1 , . . . , aH 1 , sH ) is determined by
+                                                                                           that approaches the performance of the expert ⇡ ⇤ at test
+⇡ and the MDP, and is defined as
+                                                                                           time when ⇡ ⇤ is no longer available. In order to learn rich
+                          H
+                          Y                                                                policies such as LSTMs or deep networks (Schulman et al.,
+  ⇢⇡ (⌧ ) = ⇢0 (s1 )            ⇡(at 1 |st 1 )Pt 1 (st |st 1 , at 1 ).                     2015), we derive a method related to policy gradients for
+                          t=2                                                              imitation learning and sequential prediction. To do this, we
+                                                                                           leverage the reduction of IL and sequential prediction to
+The distribution of the states at time step t, induced by run-
+                                                                                           online learning as shown in (Ross & Bagnell, 2014) to learn
+ning the policy ⇡ until t, is defined 8st :
+                                                                                           policies represented by expressive differentiable function
+                      X                        tY1                                         approximators.
+ d⇡t (st ) =                        ⇢0 (s1 )         ⇡(ai |si )Pi (si+1 |si , ai ).
+                                                                                           The fundamental idea in Ross & Bagnell (2014) is to use
+                 {si ,ai }it                  i=1
+                                1
+                                                                                           a no-regret online learner to update policies using the fol-
+Note that the summation above can be replaced by an inte-                                  lowing loss function at each episode n:
+gral if the state or action space
+                             PH is continuous. The average
+                                                                                                            1 X
+                                                                                                               H          h                i
+state distribution d¯⇡ (s) = t=1 d⇡t (s)/H.                                                                                         ⇤
+                                                                                                 `n (⇡) =            E ⇡n   E [Qt (st , a)] .       (1)
+The expected average cost of a policy ⇡ can be defined with                                                 H t=1 st ⇠dt a⇠⇡(·|st )
+respect to ⇢⇡ or {d⇡t }:
+                  "H                    #                                                  The loss function intuitively encourages the learner to
+                   X                            H
+                                                X                                          find a policy that minimize the expert’s cost-to-go under
+µ(⇡) = E                  c̄t (st , at ) =                    E           [c̄t (s, a)] .
+          ⌧ ⇠⇢⇡
+                    t=1                         t=1
+                                                      s⇠d⇡
+                                                         t (s),a⇠⇡(a|s)
+                                                                                           the state distribution resulting from the current learned
+                                                                                           policy ⇡n . Specifically, Ross & Bagnell (2014) sug-
+                                                                                           gest an algorithm named AggreVaTe (Aggregate Values
+We define the state-action value Q⇡t (s, a) (i.e., cost-to-go)
+                                                                                           to Imitate) that uses Follow-the-Leader (FTL) (Shalev-
+for policy ⇡ at time step t as:
+                                                                                           Shwartz et P  al., 2012) to update policies: ⇡n+1 =
+                                                                                                           n
+Q⇡t (st , at )     = c̄t (st , at ) +                    E              Q⇡t+1 (s, a),      arg min⇡2⇧ i=1 `n (⇡), where ⇧ is a pre-defined convex
+                                            s⇠Pt (·|st ,at ),a⇠⇡(·|s)                      policy set. When `n (⇡) is strongly convex with respect to
+                                                                                           ⇡ and ⇡ ⇤ 2 ⇧, after N iterations AggreVaTe with FTL can
+where the expectation is taken over the randomness of the
+                                                                                           find a policy ⇡
+                                                                                                         ˆ with:
+policy ⇡ and the MDP.
+We define ⇡ ⇤ as the expert policy (e.g., human demonstra-                                             ⇡ )  µ(⇡ ⇤ )
+                                                                                                     µ(ˆ               ✏N + O(ln(N )/N ),           (2)
+tors, search algorithms equipped with ground-truth) and                                                 PN                     PN
+Q⇤t (s, a) as the expert’s cost-to-go oracle. We emphasize                                 where ✏N = [ n=1 `n (⇡ ⇤ ) min⇡ n=1 `n (⇡)]/N . Note
+that ⇡ ⇤ may not be optimal, i.e., ⇡ ⇤ 62 arg min⇡ µ(⇡).                                   that ✏N    0 and the above inequality indicates that ⇡ ˆ can
+Throughout the paper, we assume Q⇤t (s, a) is known or can                                 outperform ⇡ ⇤ when ⇡ ⇤ is not (locally) optimal (i.e., ✏n >
+be estimated without bias (e.g., by rolling out ⇡ ⇤ : starting                             0). Our experimental results support this observation.
+from state s, applying action a, and then following ⇡ ⇤ for
+                                                                                           A simple implementation of AggreVaTe that aggregates the
+H t steps).
+                                                                                           values (as the name suggests) will require an exact solution
+When ⇡ is represented by a function approximator, we use                                   to a batch optimization procedure in each episode. When
+the notation ⇡✓ to represent the policy parametrized by                                    ⇡ is represented by large, non-linear function approxima-
+✓ 2 Rd : ⇡(·|s; ✓). In this work we specifically consider op-                              tors, the arg min procedure generally takes more and more
+timizing policies in which the parameter dimension d may                                   computation time as n increases. Hence an efficient in-
+be large. We also consider the partially observable setting                                cremental update procedure is necessary for the method to
+in our experiments, where the policy ⇡(·|o1 , a1 , ..., ot ; ✓)                            scale.
+                                     Differential Imitation Learning for Sequential Prediction
+
+To derive an incremental update procedure, we can take               3.2. Policy Updates with Natural Gradient Descent
+one of two routes. The first route, suggested already by
+                                                                     We derive a natural gradient update procedure for imitation
+(Ross & Bagnell, 2014), is to update our policy with an
+                                                                     learning inspired by the success of natural gradient descent
+incremental no-regret algorithm such as weighted majority
+                                                                     in RL (Kakade, 2002; Bagnell & Schneider, 2003; Schul-
+(Littlestone & Warmuth, 1994), instead of with a batch al-
+                                                                     man et al., 2015). Following (Bagnell & Schneider, 2003),
+gorithm like FTRL. Unfortunately, for rich policy classes
+                                                                     we define the Fisher information matrix I(✓n ) using trajec-
+such as deep networks, no-regret learning algorithms may
+                                                                     tory likelihood:
+not be available (e.g., a deep network policy is non-convex
+with respect to its parameters). So instead we propose a                         1                                           T
+novel second route: we directly differentiate Eq. 1, yield-          I(✓n ) =          E r✓n log(⇢⇡✓n (⌧ ))r✓n log(⇢⇡✓n (⌧ )) ,
+                                                                                H 2 ⌧ ⇠⇢⇡✓n
+ing an update related to policy gradient methods. We work
+                                                                                                                            (6)
+out the details below, including a novel update rule for IL
+based on natural gradients.                                          where r✓ log(⇢⇡⌧ (⌧ )) is the gradient of the log like-
+Interestingly, the two routes described above yield almost           PH of the trajectory ⌧ which can be computed as
+                                                                     lihood
+identical algorithms if our policy class is simple enough:              t=1 r✓ log(⇡✓ (at |st )). Note that this representation is
+e.g., for a tabular policy, AggreVaTe with weighted major-           equivalent to the original Fisher information matrix pro-
+ity yields the natural gradient version of AggreVaTeD de-            posed by (Kakade, 2002). Now, we can use Fisher infor-
+scribed below. And, the two routes yield complementary               mation matrix together with the IL gradient derived in the
+theoretical guarantees: the first route yields a regret bound        previous section (Eq. 53) to compute the natural gradient
+for simple-enough policy classes, while the second route             as I(✓n ) 1 r✓ `n (✓)|✓=✓n , which yields a natural gradient
+yields convergence to a local optimum for extremely flexi-           update: ✓n+1 = ✓n µn I(✓n ) 1 r✓ `n (✓)|✓=✓n .
+ble policy classes.                                                  Interesting, as we mentioned before, when the given MDP
+                                                                     is discrete and the policy class is in a tabular representation,
+3.1. Online Gradient Descent                                         AggreVaTe with Weighted Majority (Littlestone & War-
+                                                                     muth, 1994) yields an extremely similar update procedure
+For discrete actions, the gradient of `n (⇡✓ ) (Eq. 1) with
+                                                                     as AggreVaTeD with natural gradient. Due to space limi-
+respect to the parameters ✓ of the policy is
+                                                                     tation, we defer the detailed similarity between AggreVaTe
+                1 X
+                      H       X                                      with Weighted Majority and AggreVaTeD with natural gra-
+ r✓ `n (✓) =              E⇡     r✓ ⇡(a|st ; ✓)Q⇤t (st , a).         dient to Appendix A. As Weighted Majority can speed
+                H t=1 st ⇠d ✓n a
+                              t                                      up online learning (i.e., almost dimension free (Bubeck
+                                                               (3)   et al., 2015)) and AggreVaTe with Weighted Majority en-
+For continuous action spaces, we cannot simply replace the           joys strong theoretical guarantees on the performance of
+summation by integration since in practice it is hard to eval-       the learned policy (Ross & Bagnell, 2014), this similarity
+uate Q⇤t (s, a) for infinitely many a, so, instead, we use im-       provides an intuitive explanation why we can expect Ag-
+portance weighting to re-formulate `n (Eq. 1) as                     greVaTeD with natural gradient to speed up IL and learn a
+                                                                     high quality policy.
+                  H
+              1 X                        ⇡(a|s; ✓) ⇤
+ `n (⇡✓ ) =                  E                      Q (s, a)
+              H t=1 s⇠d⇡✓n ,a⇠⇡(·|s;✓n ) ⇡(a|s; ✓n ) t
+                          t
+                                                                     4. Sample-Based Practical Algorithms
+                          H
+                          X
+              1             ⇡(at |st ; ✓) ⇤                          In the previous section, we derived a regular gradient up-
+          =        E                       Q (st , at ).       (4)   date procedure and a natural gradient update procedure for
+              H ⌧ ⇠⇢⇡✓n t=1 ⇡(at |st ; ✓n ) t
+                                                                     IL. Note that all of the computations of gradients and Fisher
+See Appendix B for the derivation of the above equation.             information matrices assumed it was possible to exactly
+With this reformulation, the gradient with respect to ✓ is           compute expectations including Es⇠d⇡ and Ea⇠⇡(a|s) . In
+                         H
+                                                                     this section, we provide practical algorithms where we ap-
+              1         X  r✓ ⇡(at |st ; ✓) ⇤                        proximate the gradients and Fisher information matrices
+  r✓ `n (✓) =      E                       Q (st , at )
+              H ⌧ ⇠⇢⇡✓n t=1 ⇡(at |st ; ✓n ) t                        using finite samples collected during policy execution.
+                   XH
+       1                                                             4.1. Gradient Estimation and Variance Reduction
+   =     E⌧ ⇠⇢⇡✓       r✓ ln(⇡(at |st ; ✓n ))Q⇤t (st , at ).   (5)
+       H         n
+                   t=1
+                                                                     We consider an episodic framework where given a policy
+The above gradient computation enables a very efficient              ⇡n at episode n, we roll out ⇡n K times to collect K tra-
+update procedure with online gradient descent: ✓n+1 =                jectories {⌧in }, for i 2 [K], ⌧in = {si,n  i,n
+                                                                                                            1 , a1 , ...}. For gra-
+✓n ⌘n r✓ `n (✓)|✓=✓n , where ⌘n is the learning rate.                dient r✓ `n (✓)|✓=✓n we can compute an unbiased estimate
+                                     Differential Imitation Learning for Sequential Prediction
+
+using {⌧in }i2[K] :                                                  Algorithm 1 AggreVaTeD (Differentiable AggreVaTe)
+               K      H
+                                                                      1: Input: The given MDP and expert ⇡ ⇤ . Learning rate
+        1 XXX                                                              {⌘n }. Schedule rate {↵i }, ↵n ! 0, n ! 1.
+r̃✓n =              r✓n ⇡✓n (a|si,n ⇤ i,n
+                                t )Qt (st , a),
+       HK i=1 t=1 a                                                   2: Initialize policy ⇡✓1 (either random or supervised
+                                                              (7)          learning).
+               K      H
+                                                                      3: for n = 1 to N do
+          1 XX                                                        4:   Mixing policies: ⇡
+                                                                                            ˆn = ↵n ⇡ ⇤ + (1 ↵n )⇡✓n .
+r̃✓n =             r✓ ln(⇡✓n (ai,n i,n  ⇤ i,n i,n
+                               t |st ))Qt (st , at ).
+         HK i=1 t=1 n                                                 5:   Starting from ⇢0 , roll out by executing ⇡
+                                                                                                                    ˆn on the
+                                                              (8)          given MDP to generate K trajectories {⌧in }.
+                                                                      6:   Using Q⇤ and {⌧in }i , compute the descent direction
+for discrete and continuous setting respectively.                           ✓n (Eq. 7, Eq. 8, Eq. 9, or CG).
+                                                                      7:   Update: ✓n+1 = ✓n ⌘n ✓n .
+When we can compute Vt⇤ (s), we can replace Q⇤t (si,n t , a)
+                                                                      8: end for
+by the state-action advantage function A⇤t (si,n  t , a) =
+                                                                      9: Return: the best hypothesis ⇡ ˆ 2 {⇡n }n on validation.
+Q⇤t (si,n
+      t , a)   Vt⇤ (si,n
+                     t ), which leads to the following un-
+biased and variance-reduced gradient estimation for con-
+tinuous action setting (Greensmith et al., 2004):
+               K      H
+          1 XX
+r̃✓n =             r✓ ln(⇡✓n (ai,n i,n  ⇤ i,n i,n
+                               t |st ))At (st , at ),
+         HK i=1 t=1 n
+                                                              (9)
+
+In fact, we can use any baselines to reduce the variance by
+replacing Q⇤t (st , at ) by Q⇤t (st , at ) b(st ), where b( st ) :
+S ! R is a action-independent function. Ideally b(st )
+should be some function approximator that approximates                         Figure 1. The binary tree structure MDP M̃.
+V ⇤ (st ). In our experiments, we test linear function ap-
+proximator b(s) = wT s, which is online learned using ⇡ ⇤ ’s
+roll-out data.
+The Fisher information matrix (Eq. 19) is approximated as:           4.2. Differentiable Imitation Learning: AggreVaTeD
+                    K                                                Summarizing the above discussion, we present the differen-
+˜ n) =      1 X
+I(✓                r✓ log(⇢⇡✓n (⌧i ))r✓n log(⇢⇡✓n (⌧i ))T            tiable imitation learning framework AggreVaTeD, in Alg. 1.
+          H 2 K i=1 n
+                                                                     At every iteration n, the roll out policy ⇡ ˆn is a mix of the
+       = Sn SnT ,                                            (10)    expert policy ⇡ ⇤ and the current policy ⇡✓n , with mixing
+                                                                     rate ↵ (↵n ! 0, n ! 1): at every step, with probability
+where, for notation simplicity, we denote Sn as a d⇥K   pma-         ↵⇡ ˆn picks ⇡ ⇤ and picks ⇡✓n otherwise. This mixing strat-
+trix where the i’s th column is r✓n log(⇢⇡✓n (⌧i ))/(H K).           egy with the decay rate was first introduced in (Ross et al.,
+Namely the Fisher information matrix is represented by a             2011) for IL, and later on was used in sequence prediction
+sum of K rank-one matrices. For large policies represented           (Bengio et al., 2015). In Line 6, one can either choose Eq. 8
+by neural networks, K ⌧ d, and hence I(✓    ˜ n ) a low rank         or the corresponding variance reduced estimation Eq. 9 to
+matrix. One can find the descent direction ✓n by solving             perform regular gradient descent, and choose CG to per-
+the linear system Sn SnT ✓n = r̃✓n for ✓n using Conjugate            form natural gradient descent. AggreVaTeD is extremely
+Gradient (CG) with a fixed number of iterations, which is            simple: we do not need to perform any data aggregation
+equivalent to solving the above linear systems using Partial         (i.e., we do not need to store all {⌧i }i from all previous it-
+Least Squares (Phatak & de Hoog, 2002). This approach                erations); the computational complexity of each policy up-
+is used in TRPO (Schulman et al., 2015). The difference is           date scales in O(d).
+that our representation of the Fisher matrix is in the form
+of Sn SnT and in CG we never need to explicitly compute or           When we use non-linear function approximators to repre-
+store Sn SnT which requires d2 space and time. Instead, we           sent the polices, the analysis of AggreVaTe from (Ross &
+only compute and store Sn (O(Kd)) and the total compu-               Bagnell, 2014) will not hold, since the loss function `n (✓)
+tational time is still O(K 2 d). The learning-rate for natural       is not convex with respect to parameters ✓. Nevertheless,
+                                           q                         as we will show in experiments, in practice AggreVaTeD
+gradient descent can be chosen as ⌘n =             T
+                                            KL /(r̃✓n ✓n ),          is still able to learn a policy that is competitive with, and
+such that KL(⇢⇡✓n+1 (⌧ ) k⇢⇡✓n (⌧ ) ) ⇡ KL 2 R +
+                                                                     sometimes superior to, the oracle’s performance.
+                                    Differential Imitation Learning for Sequential Prediction
+
+5. Quantify the Gap: An Analysis of IL vs RL                       following regret with probability at least 1 :
+                                                                                ⇣        p             p          ⌘
+How much faster can IL learn a good policy than RL? In                 RN  O ln(S)( ln(S)N + ln(2/ )N ) .                  (13)
+this section we quantify the gap on discrete MDPs when IL
+can (1) query for an optimal Q⇤ or (2) query for a noisy but
+unbiased estimate of Q⇤ . To measure the speed of learning,        The detailed proofs of the above three theorems can be
+we look at the cumulative                                          found in Appendix E,F,G respectively. In summary, for
+                         PNregret of the entire learning pro-
+cess, defined as RN = n=1 (µ(⇡n ) µ(⇡ ⇤ )). A smaller              MDP M, IL is is exponentially faster than RL.
+regret rate indicates faster learning. Throughout this sec-
+tion, we assume the expert ⇡ ⇤ is optimal. We consider             5.2. Polynomial Gap and Near-Optimality
+finite-horizon, episodic IL and RL algorithms.
+                                                                   We next quantify the gap in general discrete MDPs and also
+                                                                   show that AggreVaTeD is near-optimal. We consider the
+5.1. Exponential Gap
+                                                                   harder case where we can only access an unbiased estimate
+We consider an MDP M shown in Fig. 1 which is a depth-             of Q⇤t , for any t and state-action pair. The policy ⇡ is rep-
+K binary tree-structure with S = 2K 1 states and two               resented as a set of probability vectors ⇡ s,t 2 (A), for all
+actions al , ar : go-left and go-right. The transition is de-      s 2 S and t 2 [H]: ⇡ = {⇡ s,t }s2S,t2[H] .
+terministic and the initial state s0 (root) is fixed. The cost     Theorem 5.4. With access to unbiased estimates of Q⇤t ,
+for each non-leaf state is zero; the cost for each leaf is i.i.d   AggreVaTeD with WM achieves the regret upper bound:
+sampled from a given distribution (possibly different dis-                                    p
+tributions per leaf). Below we show that for M, IL can be                     RN  O HQemax S ln(A)N .               (14)
+exponentially more sample efficient than RL.
+Theorem 5.1. For M, the regret RN of any finite-horizon,           Here Qemax is the maximum cost-to-go of the expert. The
+episodic RL algorithm is at least:                                 total regret shown in Eq. 14 allows us to compare IL algo-
+                                p                                  rithms to RL algorithms. For example, the Upper Confi-
+                   E[RN ] ⌦( SN ).                  (11)           dence Bound (UCB) based, near-optimal optimistic RL al-
+                                                                   gorithms from (Jaksch et al., 2010), specificallypdesigned
+The expectation is with respect to random generation of            for efficient exploration, admit p regret Õ(HS HAN ),
+cost and internal randomness of the algorithm. However,            leading to a gap of approximately HAS compared to the
+for the same MDP M, with the access to Q⇤ , we show IL             regret bound of imitation learning shown in Eq. 14.
+can learn exponentially faster:                                    We also provide a lower bound on RN for the H = 1 case
+Theorem 5.2. For the MDP M, AggreVaTe with FTL can                 which shows the dependencies on N, A, S are tight:
+achieve the following regret bound:                                Theorem 5.5. There exists an MDP (H=1) such that, with
+                                                                   only access to unbiased estimates of Q⇤ , any finite-horizon
+                      RN  O(ln (S)).                      (12)    episodic imitation learning algorithm must have:
+                                                                                                p
+Fig. 1 illustrates the intuition behind the theorem. Assume                        E[RN ] ⌦( S ln(A)N ).                   (15)
+during the first episode, the initial policy ⇡1 picks the right-
+most trajectory (bold black) to explore. We query from             The proofs of the above two theorems regarding general
+the cost-to-go oracle Q⇤ at s0 for al and ar , and learn that      MDPs can be found in Appendix H,I. In summary for dis-
+Q⇤ (s0 , al ) < Q⇤ (s0 , ar ). This immediately tells us that      crete MDPs, one can expect at least a polynomial gap and
+the optimal policy will go left (black arrow) at s0 . Hence        a possible exponential gap between IL and RL.
+the algorithm does not have to explore the right sub-tree
+(dotted circle).                                                   6. Experiments
+Next we consider a more difficult setting where one can            We evaluate our algorithms on robotics simulations from
+only query for a noisy but unbiased estimate of Q⇤ (e.g., by       OpenAI Gym (Brockman et al., 2016) and on Handwrit-
+rolling out ⇡ ⇤ finite number of times). The above halving         ten Algebra Dependency Parsing (Duyck & Gordon, 2015).
+argument will not apply since deterministically eliminating        We report reward instead of cost, since OpenAI Gym by
+nodes based on noisy estimates might permanently remove            default uses reward and dependency parsing aims to max-
+good trajectories. However, IL can still achieve a poly-log        imize UAS score. As our approach only promises there
+regret with respect to S, even in the noisy setting:
+                                                                      Here we assume Qemax is a constant compared to H. If
+Theorem 5.3. With only access to unbiased estimate of Q⇤ ,          e
+                                                                   Qmax = ⇥(H), then the expert is no better than a random policy
+for the MDP M, AggreVaTeD with WM can achieve the                  of which the cost-to-go is around ⇥(H).
+                                   Differential Imitation Learning for Sequential Prediction
+
+
+
+
+      (a) Cartpole              (b) Acrobot          (c) Acrobot (POMDP)           (d) Hopper              (e) Walker
+
+Figure 2. Performance (cumulative reward R on y-axis) versus number of episodes (n on x-axis) of AggreVaTeD (blue and green),
+experts (red), and RL algorithms (dotted) on different robotics simulators.
+
+
+exists a policy among all of the learned polices that can        6 times among 10 trials). On the contrary, AggreVaTeD
+perform as well as the expert, we report the performance         does not suffer from the delayed reward signal issue, since
+of the best policy so far: max{µ(⇡1 ), ..., µ(⇡i )}. For regu-   the expert will collect reward signals much faster than a
+lar gradient descent, we use ADAM (Kingma & Ba, 2014)            randomly initialized policy.
+which is a first-order no-regret algorithm, and for natural
+                                                                 Fig. 2c shows the performance of AggreVaTeD with an
+gradient, we use CG to compute the descent direction. For
+                                                                 LSTM policy (32 hidden states) in a partially observed
+RL we use REINFORCE (Williams, 1992) and Truncated
+                                                                 setting where the expert has access to full states but the
+Natural Policy Gradient (TNPG) (Duan et al., 2016).
+                                                                 learner has access to partial observations (link positions).
+                                                                 RL algorithms did not achieve any improvement while Ag-
+6.1. Robotics Simulations                                        greVaTeD still achieved 92% of the expert’s performance.
+We consider CartPole Balancing, Acrobot Swing-up, Hop-           In Appendix K, we provide extra experiments on partial
+per and Walker. For generating an expert, similar to previ-      observable CartPole with GRU-based policies, where we
+ous work (Ho & Ermon, 2016), we used a Deep Q-Network            demonstrate that even in partial observable setting, Aggre-
+(DQN) to generate Q⇤ for CartPole and Acrobot (e.g., to          VaTeD can learn RNN polices that outperform experts.
+simulate the settings where Q⇤ is available), while using
+                                                                 Continuous Action Setting We test our approaches on
+the publicly available TRPO implementation to generate
+                                                                 two robotics simulators with continuous actions: (1) the
+⇡ ⇤ for Hopper and Walker to simulate the settings where
+                                                                 2-d Walker and (2) the Hopper from the MuJoCo physics
+one has to estimate Q⇤ by Monte-Carlo roll outs ⇡ ⇤ .
+                                                                 simulator. Following the neural network settings described
+                                                                 in Schulman et al. (2015), the expert policy ⇡ ⇤ is obtained
+Discrete Action Setting We use a one-layer (16 hid-              from TRPO with one hidden layer (64 hidden states), which
+den units) neural network with ReLu activation functions         is the same structure that we use to represent our policies
+to represent the policy ⇡ for the Cart-pole and Acrobot          ⇡✓ . We set K = 50 and H = 100. We initialize ⇡✓1 by
+benchmarks. The value function Q⇤ is obtained from the           collecting K expert demonstrations and then maximize the
+DQN (Mnih et al., 2015) and represented by a multi-layer         likelihood of these demonstrations (i.e., supervised learn-
+fully connected neural network. The policy ⇡✓1 is initial-       ing). We use a linear baseline b(s) = wT s for RL and IL.
+ized with common ReLu neural network initialization tech-
+niques. For the scheduling rate {↵i }, we set all ↵i = 0:        Fig. 2e and 2d show the performance averaged over 5 ran-
+namely we did not roll-in using the expert’s actions dur-        dom trials. Note that AggreVaTeD outperforms the expert
+ing training. We set the number of roll outs K = 50 and          in the Walker by 13.7% while achieving 97% of the expert’s
+horizon H = 500 for CartPole and H = 200 for Acrobot.            performance in the Hopper problem. After 100 iterations,
+                                                                 we see that by leveraging the help from experts, Aggre-
+Fig. 2a and 2b shows the performance averaged over 10            VaTeD can achieve much faster improvement rate than the
+random trials of AggreVaTeD with regular gradient de-            corresponding RL algorithms (though eventually we can
+scent and natural gradient descent. Note that AggreVaTeD         expect RL to catch up). In Walker, we also tested Aggre-
+outperforms the experts’ performance significantly: Natu-        VaTeD without linear baseline, which still outperforms the
+ral gradient surpasses the expert by 5.8% in Acrobot and         expert but performed slightly worse than AggreVaTeD with
+25% in Cart-pole. Also, for Acrobot swing-up, at hori-           baseline as expected.
+zon H = 200, with high probability a randomly initialized
+neural network policy won’t be able to collect any reward
+                                                                 6.2. Dependency Parsing on Handwritten Algebra
+signals. Hence the improvement rates of REINFORCE and
+TNPG are slow. In fact, we observed that for a short hori-       We consider a sequential prediction problem: transition-
+zon such as H = 200, REINFORCE and Truncated Natural             based dependency parsing for handwritten algebra with raw
+Gradient often even fail to improve the policy at all (failed    image data (Duyck & Gordon, 2015). The parsing task
+                                         Differential Imitation Learning for Sequential Prediction
+
+ Arc-Eager   AggreVaTeD (LSTMs)   AggreVaTeD (NN)   SL-RL (LSTMs)   SL-RL(NN)     RL (LSTMs)   RL (NN)      DAgger       SL (LSTMs)    SL (NN)     Random
+ Regular     0.924±0.10           0.851±0.10        0.826± 0.09     0.386±0.1     0.256±0.07   0.227±0.06
+                                                                                                            0.832±0.02   0.813±0.1     0.325±0.2   ⇠0.150
+ Natural     0.915±0.10           0.800±0.10        0.824±0.10      0.345±0.1     0.237±0.07   0.241±0.07
+
+
+Table 1. Performance (UAS) of different approaches on handwritten algebra dependency parsing. SL stands for supervised learning using
+expert’s samples: maximizing the likelihood of expert’s actions under the sequences generated by expert itself. SL-RL means RL with
+initialization using SL. Random stands for the initial performances of random policies (LSTMs and NN). The performance of DAgger
+with Kernel SVM is from (Duyck & Gordon, 2015).
+
+for algebra is similar to the classic dependency parsing
+for natural language (Chang et al., 2015a) where the prob-
+lem is modelled in the IL setting and the state-of-the-art is
+achieved by AggreVaTe with FTRL (using Data Aggrega-
+tion). The additional challenge here is that the inputs are
+handwritten algebra symbols in raw images. We directly
+learn to predict parse trees from low level image features
+(Histogram of Gradient features (HoG)). During training,                                 (a) Validation                              (b) Test
+the expert is constructed using the ground-truth dependen-
+                                                                                Figure 3. UAS (y-axis) versus number of iterations (n on x-axis)
+cies in training data. The full state s during parsing con-
+                                                                                of AggreVaTeD with LSTM policy (blue and green), experts (red)
+sists of three data structures: Stack, Buffer and Arcs, which
+                                                                                on validation set and test set for Arc-Eager Parsing.
+store raw images of the algebraic symbols. Since the sizes
+of stack, buffer and arcs change during parsing, a com-                         icy and DAgger with a Kernelized SVM (Duyck & Gordon,
+mon approach is to featurize the state s by taking the fea-                     2015). Also AggreVaTeD with a LSTM policy achieves
+tures of the latest three symbols from stack, buffer and arcs                   97% of optimal expert’s performance. Fig. 3 shows the im-
+(e.g., (Chang et al., 2015a)). Hence the problem falls into                     provement rate of regular gradient and natural gradient on
+the partially observable setting, where the feature o is ex-                    both validation set and test set. Overall we observe that
+tracted from state s and only contains partial information                      both methods have similar performance. Natural gradient
+about s. The dataset consists of 400 sets of handwritten                        achieves a better UAS score in validation and converges
+algebra equations. We use 80% for training, 10% for val-                        slightly faster on the test set but also achieves a lower UAS
+idation, and 10% for testing. We include an example of                          score on test set.
+handwritten algebra equations and its dependency tree in
+Appendix J. Note that different from robotics simulators                        7. Conclusion
+where at every episode one can get fresh data from the sim-                     We introduced AggreVaTeD, a differentiable imitation
+ulators, the dataset is fixed and sample efficiency is critical.                learning algorithm which trains neural network policies for
+The RNN policy follows the design from (Sutskever et al.,                       sequential prediction tasks such as continuous robot control
+2014). It consists of two LSTMs. Given a sequence of al-                        and dependency parsing on raw image data. We showed
+gebra symbols ⌧ , the first LSTM processes one symbol at                        that in theory and in practice IL can learn much faster
+a time and at the end outputs its hidden states and mem-                        than RL with access to optimal cost-to-go oracles. The IL
+ory (i.e., a summary of ⌧ ). The second LSTM initializes its                    learned policies were able to achieve expert and sometimes
+own hidden states and memory using the outputs of the first                     super-expert levels of performance in both fully observable
+LSTM. At every parsing step t, the second LSTM takes the                        and partially observable settings. The theoretical and ex-
+current partial observation ot (ot consists of features of the                  perimental results suggest that IL is significantly more ef-
+most recent item from stack, buffer and arcs) as input, and                     fective than RL for sequential prediction with near optimal
+uses its internal hidden state and memory to compute the                        cost-to-go oracles.
+action distribution ⇡(·|o1 , ..., ot , ⌧ ) conditioned on history.
+We also tested reactive policies constructed as fully con-                      Acknowledgement
+nected ReLu neural networks (NN) (one-layer with 1000
+hidden states) that directly maps from observation ot to ac-                    This research was supported in part by ONR 36060-1b-
+tion a, where ot uses the most three recent items. We use                       1141268.
+variance reduced gradient estimations, which give better
+performance in practice. The performance is summarised                          References
+in Table 1. Due to the partial observability of the prob-                       Abbeel, Pieter and Ng, Andrew Y. Apprenticeship learning via
+lem, AggreVaTeD with a LSTM policy achieves signifi-                              inverse reinforcement learning. In ICML, pp. 1. ACM, 2004.
+cantly better UAS scores compared to the NN reactive pol-
+                                                                                Bagnell, J Andrew and Schneider, Jeff. Covariant policy search.
+                                     Differential Imitation Learning for Sequential Prediction
+
+  IJCAI, 2003.                                                       Kahn, Gregory, Zhang, Tianhao, Levine, Sergey, and Abbeel,
+                                                                       Pieter. Plato: Policy learning using adaptive trajectory opti-
+Bahdanau, Dzmitry, Brakel, Philemon, Xu, Kelvin, Goyal,                mization. arXiv preprint arXiv:1603.00622, 2016.
+  Anirudh, Lowe, Ryan, Pineau, Joelle, Courville, Aaron, and
+  Bengio, Yoshua. An actor-critic algorithm for sequence pre-        Kakade, Sham. A natural policy gradient. NIPS, 2002.
+  diction. arXiv preprint arXiv:1607.07086, 2016.
+                                                                     Kakade, Sham and Langford, John. Approximately optimal ap-
+Bengio, Samy, Vinyals, Oriol, Jaitly, Navdeep, and Shazeer,            proximate reinforcement learning. In ICML, 2002.
+  Noam. Scheduled sampling for sequence prediction with re-
+  current neural networks. In NIPS, 2015.                            Kingma, Diederik and Ba, Jimmy. Adam: A method for stochas-
+                                                                       tic optimization. arXiv preprint arXiv:1412.6980, 2014.
+Brockman, Greg, Cheung, Vicki, Pettersson, Ludwig, Schneider,
+  Jonas, Schulman, John, Tang, Jie, and Zaremba, Wojciech.           Li, Jiwei, Monroe, Will, Ritter, Alan, Galley, Michel, Gao, Jian-
+  Openai gym. arXiv preprint arXiv:1606.01540, 2016.                    feng, and Jurafsky, Dan. Deep reinforcement learning for dia-
+                                                                        logue generation. arXiv preprint arXiv:1606.01541, 2016.
+Bubeck, Sébastien, Cesa-Bianchi, Nicolo, et al. Regret analysis
+  of stochastic and nonstochastic multi-armed bandit problems.       Littlestone, Nick and Warmuth, Manfred K. The weighted major-
+  Foundations and Trends R in Machine Learning, 2012.                   ity algorithm. Information and computation, 108(2):212–261,
+                                                                        1994.
+Bubeck, Sébastien et al. Convex optimization: Algorithms and
+  complexity. Foundations and Trends R in Machine Learning,          Mnih, Volodymyr et al. Human-level control through deep rein-
+  2015.                                                               forcement learning. Nature, 2015.
+
+Chang, Kai-Wei, He, He, Daumé III, Hal, and Langford,               Phatak, Aloke and de Hoog, Frank. Exploiting the connection
+  John. Learning to search for dependencies. arXiv preprint            between pls, lanczos methods and conjugate gradients: alterna-
+  arXiv:1503.05615, 2015a.                                             tive proofs of some properties of pls. Journal of Chemometrics,
+                                                                       2002.
+Chang, Kai-wei, Krishnamurthy, Akshay, Agarwal, Alekh,
+  Daume, Hal, and Langford, John. Learning to search better          Ranzato, Marc’Aurelio, Chopra, Sumit, Auli, Michael, and
+  than your teacher. In ICML, 2015b.                                   Zaremba, Wojciech. Sequence level training with recurrent
+                                                                       neural networks. ICLR 2016, 2015.
+Choudhury, Sanjiban, Kapoor, Ashish, Ranade, Gireeja, Scherer,
+  Sebastian, and Dey, Debadeepta. Adaptive information gather-       Ratliff, Nathan D, Bagnell, J Andrew, and Zinkevich, Martin A.
+  ing via imitation learning. RSS, 2017.                               Maximum margin planning. In ICML, 2006.
+
+Chung, Junyoung, Gulcehre, Caglar, Cho, KyungHyun, and               Rhinehart, Nicholas, Zhou, Jiaji, Hebert, Martial, and Bagnell,
+  Bengio, Yoshua. Empirical evaluation of gated recurrent              J Andrew. Visual chunking: A list prediction framework for
+  neural networks on sequence modeling.   arXiv preprint               region-based object detection. In ICRA. IEEE, 2015.
+  arXiv:1412.3555, 2014.
+                                                                     Ross, Stéphane and Bagnell, J. Andrew. Efficient reductions for
+Daumé III, Hal, Langford, John, and Marcu, Daniel. Search-            imitation learning. In AISTATS, pp. 661–668, 2010.
+  based structured prediction. Machine learning, 2009.
+                                                                     Ross, Stephane and Bagnell, J Andrew. Reinforcement and imita-
+Duan, Yan, Chen, Xi, Houthooft, Rein, Schulman, John, and              tion learning via interactive no-regret learning. arXiv preprint
+  Abbeel, Pieter. Benchmarking deep reinforcement learning for         arXiv:1406.5979, 2014.
+  continuous control. In ICML, 2016.
+                                                                     Ross, Stéphane, Gordon, Geoffrey J, and Bagnell, J.Andrew. A
+Duyck, James A and Gordon, Geoffrey J. Predicting structure in         reduction of imitation learning and structured prediction to no-
+  handwritten algebra data from low level features. Data Analy-        regret online learning. In AISTATS, 2011.
+  sis Project Report, MLD, CMU, 2015.
+                                                                     Ross, Stephane, Zhou, Jiaji, Yue, Yisong, Dey, Debadeepta, and
+Finn, Chelsea, Levine, Sergey, and Abbeel, Pieter. Guided cost         Bagnell, Drew. Learning policies for contextual submodular
+   learning: Deep inverse optimal control via policy optimization.     prediction. In ICML, 2013.
+   In ICML, 2016.
+                                                                     Schulman, John, Levine, Sergey, Abbeel, Pieter, Jordan,
+Greensmith, Evan, Bartlett, Peter L, and Baxter, Jonathan. Vari-       Michael I, and Moritz, Philipp. Trust region policy optimiza-
+  ance reduction techniques for gradient estimates in reinforce-       tion. In ICML, pp. 1889–1897, 2015.
+  ment learning. JMLR, 2004.
+                                                                     Shalev-Shwartz, Shai et al. Online learning and online convex
+Ho, Jonathan and Ermon, Stefano. Generative adversarial imita-         optimization. Foundations and Trends R in Machine Learning,
+  tion learning. In NIPS, 2016.                                        2012.
+
+Hochreiter, Sepp and Schmidhuber, Jürgen. Long short-term           Silver, David et al. Mastering the game of go with deep neural
+  memory. Neural computation, 9(8):1735–1780, 1997.                     networks and tree search. Nature, 2016.
+
+Jaksch, Thomas, Ortner, Ronald, and Auer, Peter. Near-optimal        Sutskever, Ilya, Vinyals, Oriol, and Le, Quoc V. Sequence to
+   regret bounds for reinforcement learning. JMLR, 2010.               sequence learning with neural networks. In NIPS, 2014.
+                                   Differential Imitation Learning for Sequential Prediction
+
+Syed, Umar, Bowling, Michael, and Schapire, Robert E. Appren-
+  ticeship learning using linear programming. In ICML, 2008.
+
+Venkatraman, Arun, Hebert, Martial, and Bagnell, J Andrew. Im-
+  proving multi-step prediction of learned time series models.
+  AAAI, 2015.
+
+Williams, Ronald J. Simple statistical gradient-following al-
+  gorithms for connectionist reinforcement learning. Machine
+  learning, 1992.
+
+Ziebart, Brian D, Maas, Andrew L, Bagnell, J Andrew, and Dey,
+   Anind K. Maximum entropy inverse reinforcement learning.
+   In AAAI, 2008.
+
+Zinkevich, Martin. Online Convex Programming and Generalized
+  Infinitesimal Gradient Ascent. In ICML, 2003.
+

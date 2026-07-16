@@ -1,0 +1,268 @@
+{
+  "intake": {
+    "domain": "Learning-based combinatorial optimization for multi-satellite Earth observation scheduling with large dynamic feasible task-satellite-window action sets",
+    "venue": "unspecified",
+    "time": "unspecified",
+    "data": [
+      "Local EOS-Bench fork with schedule-to-trajectory export and schema validation",
+      "15 schedules from MIP, greedy heuristics, SA, GA, ACO, and PPO converted into approximately 7,500 state-action trajectory records",
+      "Recovered feasible candidate sets with 100% expert-action matching and candidate caps observed to require up to 8,192 entries",
+      "EOS-Bench scenario generator, constraints, multidimensional schedule metrics, and solver baselines"
+    ],
+    "compute": "One Windows 11 workstation with an NVIDIA RTX 4070 Ti (12 GB VRAM) and desktop multicore CPU; optional RTX 3060 Ti host for labeling/debug; Mac for light analysis; no A100/H100; counterfactual labels must be generated offline, cached, resumable, and CPU-parallel",
+    "expertise": "EOS scheduling and solver integration, trajectory-data engineering, behavior cloning, small PyTorch policy models, and empirical benchmarking",
+    "preference": "empirical",
+    "baseline": "EOS-Bench MIP, profit/completion/timeliness/balance greedy rules, SA, GA, ACO, PPO, plus BC-Single, BC-All, and schedule-quality-weighted BC",
+    "limitation": "Solver trajectories retain only the chosen feasible action; one-hot behavior cloning assigns the same negative target to all unchosen feasible actions despite heterogeneous downstream opportunity costs, while exhaustively rolling out every alternative is infeasible for candidate sets in the hundreds or thousands.",
+    "contribution_type": "method",
+    "_inferred_fields": [
+      "expertise",
+      "preference"
+    ]
+  },
+  "bottleneck_statement": "EOS-Bench exposes sequential states with masked task-satellite-window actions and shows that strong optimization and meta-heuristic solvers return complete plans while its PPO baseline learns from task-profit rewards on the action actually selected [arxiv:2604.25782v1]; comparable model-free learned policies in heterogeneous EO clusters [arxiv:2605.31023v1] and Masked-PPO orbital planning [arxiv:2602.17685v1] likewise learn through visited decisions rather than furnishing the downstream cost of every currently feasible alternative. Consequently, when solver schedules are converted to one-hot demonstrations, unselected actions that differ sharply in future window conflicts, attitude transitions, scarce-resource consumption, and displaced high-value tasks collapse to the same target, yet recovering those distinctions exhaustively grows as |A(s)|H; the current machinery therefore cannot provide reliable candidate-specific downstream opportunity-cost supervision at the action-set scale needed to distinguish a harmless feasible mistake from one that irreversibly damages the remaining schedule.",
+  "closest_adjacent": [
+    {
+      "paper_id": "arxiv:2604.25782v1",
+      "is_anchor": true,
+      "summary_and_residue": "EOS-Bench unifies realistic agile/non-agile constraints and heterogeneous solver classes, including a PPO agent that chooses one masked task-satellite-window or skip action per step from current time, remaining tasks, and resource budgets and is trained on task profit. It does not convert its stronger solver outputs into candidate-level cost-to-go supervision, and its PPO remains below leading SA/ACO results on reported scenarios, leaving unresolved whether fast learned inference can distinguish mildly suboptimal feasible choices from choices that destroy downstream opportunities."
+    },
+    {
+      "paper_id": "arxiv:2605.31023v1",
+      "is_anchor": false,
+      "summary_and_residue": "HADT uses relational observation-action tokenization and differential attention in a model-free multi-agent transformer for adaptive decisions in heterogeneous optical/SAR EO clusters. The available abstract neither establishes hard-constraint guarantees nor reports candidate-specific downstream opportunity-cost supervision, so whether its scores distinguish feasible actions by long-horizon schedule damage remains unestablished at abstract-level confidence."
+    },
+    {
+      "paper_id": "arxiv:2602.17685v1",
+      "is_anchor": false,
+      "summary_and_residue": "This work embeds co-elliptic transfers, safety ellipses, refueling, and delta-V limits in a 50-target discrete orbital-planning environment and compares Masked PPO against greedy search and MCTS. Its policy is still learned from visited trajectory returns rather than explicit costs for unchosen feasible targets, and its 100 simulated scenarios do not close the large-action-set counterfactual-supervision gap faced by EOS schedules."
+    }
+  ],
+  "what_phase_0_did_not_address": [
+    "No retrieved frontier leaf makes heterogeneous downstream opportunity costs among currently feasible but unselected assignments learnable when evaluating all alternatives is computationally prohibitive.",
+    "No retrieved frontier leaf establishes when a bounded amount of alternative-action evidence preserves the ordering of low- versus high-damage scheduling choices as feasible-set size and conflict intensity grow.",
+    "No retrieved paper tests whether the learning signal must be attached only to the single action executed at each partial-schedule state."
+  ],
+  "method_lineage": {
+    "line": "candidate valuation in masked neural constructive policies for constrained sequential satellite and orbital scheduling",
+    "nodes": [
+      {
+        "node_id": "n0",
+        "method": "Sequential constructive scheduling over a dynamically feasible action set",
+        "move": "Recasts a global constrained schedule as repeated selection of one feasible assignment from each partial schedule.",
+        "parent": null,
+        "provenance": "parametric",
+        "age_band": ">16y",
+        "confidence": "high",
+        "residual_problem": "Immediate feasibility and local score do not reveal the delayed opportunity loss caused by the selected assignment.",
+        "is_frontier_leaf": false,
+        "is_collateral": false
+      },
+      {
+        "node_id": "n1",
+        "method": "Neural combinatorial optimization with policy-gradient sequence construction",
+        "move": "Learns a stochastic constructive policy from complete-sequence return instead of hand-coding the next-action rule.",
+        "parent": "n0",
+        "provenance": "parametric",
+        "age_band": "8-16y",
+        "confidence": "high",
+        "residual_problem": "Selected-action Monte Carlo feedback is high variance and sparsely covers the many feasible alternatives at each state.",
+        "is_frontier_leaf": false,
+        "is_collateral": false
+      },
+      {
+        "node_id": "n2",
+        "method": "PPO-style neural constructive policy optimization",
+        "move": "Stabilizes policy-gradient updates with a clipped objective while retaining sampled sequential decisions and episodic rewards.",
+        "parent": "n1",
+        "provenance": "parametric",
+        "age_band": "8-16y",
+        "confidence": "high",
+        "residual_problem": "Clipping improves optimization stability but does not supply candidate-specific cost-to-go for actions that were not sampled.",
+        "is_frontier_leaf": false,
+        "is_collateral": false
+      },
+      {
+        "node_id": "n3",
+        "method": "Attention-based constructive policy with dynamic feasibility masking",
+        "move": "Scores variable-size candidate sets with shared attention and removes infeasible moves through a state-dependent mask.",
+        "parent": "n2",
+        "provenance": "parametric",
+        "age_band": "4-8y",
+        "confidence": "high",
+        "residual_problem": "Masking guarantees local admissibility but still treats feasible alternatives mainly as competitors for the sampled action probability, not as actions with separately supervised downstream costs.",
+        "is_frontier_leaf": false,
+        "is_collateral": false
+      },
+      {
+        "node_id": "n4",
+        "method": "EOS-specific PPO task/window sequencing",
+        "move": "Instantiates masked policy learning on satellite-task-window choices with orbital, temporal, and resource state.",
+        "parent": "n3",
+        "provenance": "parametric",
+        "age_band": "2-4y",
+        "confidence": "medium",
+        "residual_problem": "EOS-specific state and constraints do not resolve the absence of dense downstream-risk information for unchosen feasible assignments.",
+        "is_frontier_leaf": false,
+        "is_collateral": false
+      },
+      {
+        "node_id": "n5",
+        "method": "EOS-Bench masked PPO baseline over task-satellite-window actions",
+        "move": "Places one profit-trained masked PPO scheduler beside exact, greedy, and meta-heuristic solvers under a common large-scale EOS benchmark.",
+        "parent": "n4",
+        "provenance": "retrieved:arxiv:2604.25782v1",
+        "age_band": "0-2y",
+        "confidence": "high",
+        "residual_problem": "The benchmark yields solver plans and a sampled-return PPO policy but no candidate-level downstream-cost supervision from the stronger solver trajectories; PPO remains below leading meta-heuristics on reported cases.",
+        "is_frontier_leaf": true,
+        "is_collateral": false
+      },
+      {
+        "node_id": "n6",
+        "method": "HADT relational transformer for heterogeneous EO clusters",
+        "move": "Adds relational observation-action tokens and differential attention for adaptive model-free decisions across heterogeneous satellite types.",
+        "parent": "n3",
+        "provenance": "retrieved:arxiv:2605.31023v1",
+        "age_band": "0-2y",
+        "confidence": "high",
+        "residual_problem": "Candidate-specific long-horizon damage, hard-constraint guarantees, and robustness beyond the tested cluster distributions remain unresolved.",
+        "is_frontier_leaf": true,
+        "is_collateral": false
+      },
+      {
+        "node_id": "n7",
+        "method": "Masked PPO for resource-constrained multi-debris orbital planning",
+        "move": "Unifies transfers, keep-out behavior, refueling, and delta-V constraints in a masked learned sequencing policy.",
+        "parent": "n2",
+        "provenance": "retrieved:arxiv:2602.17685v1",
+        "age_band": "0-2y",
+        "confidence": "high",
+        "residual_problem": "The policy does not expose downstream costs for unchosen feasible targets, and evidence stops at 50-target missions over 100 simulated scenarios.",
+        "is_frontier_leaf": true,
+        "is_collateral": false
+      },
+      {
+        "node_id": "c1",
+        "method": "Behavior cloning by maximum-likelihood action imitation",
+        "move": "Learns the demonstrated action directly from expert state-action pairs without executing a planning search during training.",
+        "parent": null,
+        "provenance": "parametric",
+        "age_band": ">16y",
+        "confidence": "high",
+        "residual_problem": "One-hot supervision collapses unequal costs among unchosen actions and suffers from learner-state distribution shift.",
+        "is_frontier_leaf": false,
+        "is_collateral": true
+      },
+      {
+        "node_id": "c2",
+        "method": "SEARN cost-sensitive learning to search",
+        "move": "Reduces structured sequential prediction to cost-sensitive decisions whose labels are estimated by rollouts.",
+        "parent": null,
+        "provenance": "parametric",
+        "age_band": ">16y",
+        "confidence": "high",
+        "residual_problem": "Estimating decision costs by broad rollout becomes expensive as both horizon and action-set size grow.",
+        "is_frontier_leaf": false,
+        "is_collateral": true
+      },
+      {
+        "node_id": "c3",
+        "method": "DAgger learner-state dataset aggregation",
+        "move": "Queries expert actions on states induced by the learner and aggregates them to reduce covariate shift.",
+        "parent": null,
+        "provenance": "parametric",
+        "age_band": "8-16y",
+        "confidence": "high",
+        "residual_problem": "It improves state coverage but ordinary expert-action labels still do not distinguish costs among feasible nonexpert actions.",
+        "is_frontier_leaf": false,
+        "is_collateral": true
+      },
+      {
+        "node_id": "c4",
+        "method": "AggreVaTe expert cost-to-go imitation",
+        "move": "Uses expert cost-to-go feedback at learner states to train a cost-sensitive policy rather than only cloning the expert action.",
+        "parent": null,
+        "provenance": "parametric",
+        "age_band": "8-16y",
+        "confidence": "high",
+        "residual_problem": "Its oracle cost-to-go queries become prohibitive when thousands of dynamic feasible actions would each require continuation evaluation.",
+        "is_frontier_leaf": false,
+        "is_collateral": true
+      },
+      {
+        "node_id": "c5",
+        "method": "Q-learning action-value estimation",
+        "move": "Learns long-term values for state-action pairs by temporal-difference bootstrapping rather than explicit expert rollouts.",
+        "parent": null,
+        "provenance": "parametric",
+        "age_band": ">16y",
+        "confidence": "high",
+        "residual_problem": "Reliable values still depend on action coverage and stable bootstrapping, both difficult under huge state-dependent constrained action sets.",
+        "is_frontier_leaf": false,
+        "is_collateral": true
+      },
+      {
+        "node_id": "c6",
+        "method": "UCT-style Monte Carlo tree search",
+        "move": "Allocates simulations selectively across promising actions to approximate delayed consequences without exhaustive tree enumeration.",
+        "parent": null,
+        "provenance": "parametric",
+        "age_band": ">16y",
+        "confidence": "high",
+        "residual_problem": "It pays lookahead cost at planning time and by itself does not amortize candidate-specific risk into a fast offline-trained scheduler.",
+        "is_frontier_leaf": false,
+        "is_collateral": true
+      }
+    ],
+    "notes": "Retrieved nodes are grounded frontier evidence; parametric nodes are awareness-only ancestry used to prevent regression and are not hard novelty citations. The 2-4y EOS-specific node is deliberately medium confidence, while textbook-deep nodes are high confidence. Recognized residual-attacking families were demonstration imitation, cost-sensitive learning-to-search, learner-state aggregation, expert cost-to-go imitation, temporal-difference action values, and selective tree search; their named oldest representatives are collateral only, have no parent, and are never gap sites or shared-ancestor evidence. Only n5-n7 are legal frontier gap sites, and no unnamed or merely suspected predecessor is used to suppress a gap."
+  },
+  "domain_pattern_distribution": {
+    "n_total": 10,
+    "n_on_topic": 10,
+    "patterns": [
+      {
+        "pattern_id": "reframe_as_solvable_object",
+        "count": 6,
+        "share": 0.6,
+        "saturation_band": "saturated"
+      },
+      {
+        "pattern_id": "decompose_and_delegate",
+        "count": 2,
+        "share": 0.2,
+        "saturation_band": "mid_frequency"
+      },
+      {
+        "pattern_id": "controlled_diagnostic_design",
+        "count": 1,
+        "share": 0.1,
+        "saturation_band": "untested"
+      },
+      {
+        "pattern_id": "unify_into_shared_representation",
+        "count": 3,
+        "share": 0.3,
+        "saturation_band": "mid_frequency"
+      },
+      {
+        "pattern_id": "heterogeneous_decomposition",
+        "count": 1,
+        "share": 0.1,
+        "saturation_band": "untested"
+      },
+      {
+        "pattern_id": "structural_prior_encoding",
+        "count": 3,
+        "share": 0.3,
+        "saturation_band": "mid_frequency"
+      }
+    ],
+    "saturation_threshold_saturated": 0.5,
+    "saturation_threshold_untested_count": 1,
+    "notes": "reframe_as_solvable_object is most used (6/10); the closest learned-policy paper using it reformulates heterogeneous EO cluster scheduling as model-free decision making but still leaves candidate-specific downstream risk unmeasured."
+  },
+  "state": "proceed",
+  "ood_reasons": [],
+  "remedial_steps": []
+}

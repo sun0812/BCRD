@@ -1,0 +1,61 @@
+{
+  "title": "Budgeted Counterfactual Regret Distillation for Large-Action Earth Observation Scheduling",
+  "hook": "Sixteen counterfactual probes per state should preserve the low- versus high-damage action ordering even when EOS-Bench exposes thousands of feasible actions, until conflict coverage—not candidate count—crosses a measurable threshold. If that ordering is causal, normalized terminal schedule quality Q should rise over one-hot behavior cloning while a within-state order permutation erases the gain.",
+  "hook_shape_rationale": "This is a surprising empirical reveal: the falsification test names an increase in downstream Q and predicts a regime split governed by counterfactual coverage rather than raw feasible-set size. Counter-intuitive minimalism was also viable, but rejected because the method keeps model size and demonstrations fixed while still adding offline label-generation compute.",
+  "gap_closure": [
+    {
+      "gap": "No retrieved frontier leaf makes heterogeneous downstream opportunity costs among currently feasible but unselected assignments learnable when evaluating all alternatives is computationally prohibitive.",
+      "main_pattern": "self_supervised_signal_engineering",
+      "sub_pattern": "C26 (Manufacture the Supervisory Signal)",
+      "companion_pattern": null,
+      "how_closed": "A deterministic, conflict-covering probe set yields within-state comparative regret pairs from constraint-verified repaired schedules, and a native logit-ranking loss consumes those pairs without evaluating every feasible action."
+    },
+    {
+      "gap": "No retrieved frontier leaf establishes when a bounded amount of alternative-action evidence preserves the ordering of low- versus high-damage scheduling choices as feasible-set size and conflict intensity grow.",
+      "main_pattern": "controlled_diagnostic_design",
+      "sub_pattern": "C02 (Design a Confound-Isolating Diagnostic)",
+      "companion_pattern": null,
+      "how_closed": "Matched EOS-Bench states independently vary feasible-set size and conflict intensity, while exhaustive small-state continuations provide an evaluator-independent oracle for measuring rank preservation."
+    },
+    {
+      "gap": "No retrieved paper tests whether the learning signal must be attached only to the single action executed at each partial-schedule state.",
+      "main_pattern": "assumption_audit_and_pivot",
+      "sub_pattern": "C11 (Audit and Pivot an Assumption)",
+      "companion_pattern": "controlled_diagnostic_design",
+      "how_closed": "The executed-action-only rule is reframed as budgeted evidence acquisition over feasible actions, with a margin-and-coverage certificate for the pivoted rule and a matched diagnostic that tests its downstream scheduling effect."
+    }
+  ],
+  "core_mechanism": "The shared object is a statewise counterfactual damage order: for partial schedule s and feasible action a, the method constructs an estimated regret r_tilde_s(a) whose smaller values should receive larger policy logits. Each action first receives a dimensionless structural vector u_s(a) in [0,1]^5 containing constraint-checker outputs: future expert-suffix profit invalidated by a divided by remaining suffix profit, action energy divided by remaining energy, action storage divided by remaining storage, transition time divided by remaining horizon, and one minus clipped feasible-window slack divided by remaining horizon. The probe budget is B_s=min(16,|A_s|): retain the demonstrated action, add the actions with minimum and maximum mean component of u_s(a), then apply deterministic farthest-first Euclidean selection with candidate-ID tie-breaking until B_s actions are chosen; its coverage radius is epsilon_s=max_a min_q ||u_s(a)-u_s(q)||_2. For each probe q, replay the identical prefix, force q, delete suffix assignments made infeasible by q, and attempt at most 64 deterministic reinsertion moves ordered lexicographically by descending normalized profit and ascending slack, producing a cached repaired terminal schedule without tree search. Its dimensionless quality is Q=0.25(TP/available-profit)+0.25TCR+0.25BD+0.25(1-TM), using EOS-Bench metrics, and probe regret is r_s(q)=Q(reference suffix)-Q(repaired suffix after q). Every action inherits the regret of its nearest probe q_s(a), with stable ties, and the load-bearing comparison is Delta_s(a,b)=r_tilde_s(a)-r_tilde_s(b). The policy minimizes L_BC+beta L_pair, where L_pair is logistic loss on the sign of Delta over all probe pairs plus at most 48 farthest unqueried representatives, temperature is fixed at 0.1, and beta is selected from {0.1,0.3,1.0} by validation Q. If true regret is L-Lipschitz in u and repair-label error is at most e, nearest-probe interpolation preserves every pair whose true margin exceeds 2(L*epsilon_s+e); one-sided 95% upper bounds for L and e are estimated only from exact small-state continuations, and the certificate is reported only where this inequality holds. The C02 diagnostic builds matched states that vary |A_s| while holding the conflict-vector distribution fixed, or vary EOS-Bench conflict intensity at matched |A_s|, and uses forced-action MIP continuations on tractable states as an oracle independent of the learned policy and bounded repair. Thus the method manufactures comparative supervision and audits the executed-action assumption offline, while avoiding learner-state oracle querying, temporal-difference bootstrapping, and online tree search.",
+  "core_mechanism_reasoning": "All three gaps concern the same counterfactual damage order: C26 constructs it, C02 measures when a bounded construction preserves it, and C11 replaces the one-action selection rule with a certified budgeted rule. The architectural-operator subclusters targeted privacy, network plumbing, dense pairwise attention, or curvature rather than counterfactual-label cost, so the anchor moved to C26's method-grade comparative scalar reward. Broad rollouts, expert cost-to-go enumeration, temporal-difference values, and online MCTS were rejected because they regress to the lineage's SEARN, AggreVaTe, Q-learning, and UCT nodes rather than amortizing a bounded offline partial order.",
+  "core_mechanism_steps": "1. Reconstruct each expert partial state and its complete feasible action set from cached EOS-Bench trajectories; input is a validated schedule trajectory and output is (s,A_s,a_star).\n2. Extend the constraint checker to compute the five normalized components u_s(a) for every feasible action; input is (s,a) and output is one cached structural vector.\n3. Select B_s probes with the fixed extrema-plus-farthest-first rule; input is all u_s(a) and output is probe IDs and epsilon_s.\n4. For every probe, force it after the unchanged prefix and run the capped 64-move suffix repair; input is the reference suffix and probe action, and output is a feasible terminal schedule plus Q.\n5. Cache probe regrets and nearest-probe assignments; input is probe Q values and structural vectors, and output is r_tilde_s(a) and Delta_s(a,b).\n6. Add the pairwise logistic term to the existing behavior-cloning training loop; input is policy logits and comparison signs, and output is an updated policy whose changed logits alter the next scheduled task-satellite-window action.\n7. Tune beta only on validation Q and train BC-Single, BC-All, weighted BC, and BCRD with identical architectures and seeds; output is directly comparable checkpoints.\n8. Generate matched diagnostic states and exhaustively solve each forced-action continuation only in the tractable subset; output is gold action regret, rank correlation, L/e bounds, and certificate coverage.\n9. Roll each checkpoint to terminal schedules on held-out EOS-Bench scenarios stratified by action-set size and conflict intensity; output is TP, TCR, BD, TM, Q, runtime, and feasibility violations.",
+  "falsification_prediction": "On the existing approximately 7,500 trajectory states, generate B_s<=16 probe labels, train the same small policy architecture for five seeds, and evaluate held-out EOS-Bench scenarios plus a tractable exhaustive-continuation subset. If the mechanism works, BCRD's terminal Q will increase over BC-All and schedule-quality-weighted BC, while Spearman rank correlation to exhaustive action regret stays higher in matched large-action states than in matched high-conflict states. The single load-bearing variable is Delta_s(a,b), the within-state estimated regret difference that supplies each preference direction. As a negative control, randomly permute Delta_s(a,b) directions within every state while preserving probe count, pair count, optimizer steps, and marginal label balance; terminal Q should return to the BC-All confidence interval, otherwise the claimed counterfactual-order mechanism is falsified.",
+  "compute_budget": "GPU: approximately 1.5 80GB-class-equivalent GPU-days for the full five-seed campaign, realizable as about 6 RTX 4070 Ti 12GB GPU-days with small sequential batches; CPU: approximately 20-35 desktop CPU-days for cached, resumable, parallel probe repair and exact small-state labels. API: $0; no paid model or judge calls.",
+  "differentiation_from_lit": [
+    {
+      "paper_id": "arxiv:2604.25782v1",
+      "delta": "EOS-Bench constructs masked PPO from visited task-profit rewards and compares complete solver plans, whereas this candidate converts the same constraint engine and solver suffixes into bounded within-state regret orderings for unexecuted feasible actions and trains those orderings directly into policy logits."
+    },
+    {
+      "paper_id": "arxiv:2605.31023v1",
+      "delta": "HADT contributes relational observation-action tokenization and differential attention for model-free heterogeneous-cluster decisions, while this candidate constructs constraint-verified comparative supervision and an action-set-size-versus-conflict diagnostic absent from the available abstract (abstract-only inference)."
+    },
+    {
+      "paper_id": "arxiv:2602.17685v1",
+      "delta": "The debris planner trains masked PPO and benchmarks it against greedy search and MCTS on 50-target missions, whereas this candidate amortizes a fixed offline budget of repaired alternative-action comparisons into a policy and tests ordering preservation up to EOS-Bench-scale feasible sets."
+    }
+  ],
+  "almost_prior_paper_id": "arxiv:2604.25782v1",
+  "what_step_was_missed": "EOS-Bench would have needed to expose each solver prefix as a shared counterfactual state, force a conflict-covering subset of nonchosen feasible actions through capped suffix repair, and optimize the policy on the resulting within-state regret order rather than only the executed action's profit reward.",
+  "signature_terms": [
+    "conflict-cover preference supervision",
+    "bounded alternative-action ordering",
+    "constraint-repair comparison pairs",
+    "massive masked action sets"
+  ],
+  "alias_terms": [
+    "cost-sensitive learning to search",
+    "active preference query selection",
+    "counterfactual policy distillation",
+    "dueling action ranking"
+  ]
+}
